@@ -1,0 +1,3062 @@
+---
+title: "Distancias Lima ATU 2023"
+author: "Hugo Thomas"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE, verbose = FALSE) 
+    knitr::opts_chunk$set(dev = "svg",
+                          dpi = 300,
+                          echo = TRUE,
+                          cache = TRUE,
+                          cache.lazy = FALSE)
+```
+
+
+# Introducción
+
+La encuesta domiciliaria de origen-destino en hogares ATU 2023 se compone de 3 bases de datos:
+
+* 6,010 Hogares entrevistados (de un total de 13,778 que fueron seleccionados)
+* 19,065 Personas
+* 32,448 Viajes
+
+El Area de Lima Metropolitana esta divido en **1,209 zonas, las cuales no son comparables con las ZAT de la encuesta que hizo la JICA en el 2012**. Sin embargo, **existe un problema de muestreo** ya que solo 641 de estas 1,209 zonas (el 53%) tienen por lo menos un hogar encuestado. Entonces estas zonas no son adaptadas para calcular indicadores a la escala infra-distrital. Como solución, hemos explorado sustituirlas por las ZAT de la encuesta del 2012. Resulta que 344 de las 409 ZAT (84%) tienen por lo menos un hogar encuestado, lo cual es mucho más adaptado. Sin embargo, ante el efecto gráfico de la ausencia de datos en el 16% de las zonas, adoptamos una representación a nivel de distrito.
+
+
+# Nota sobre los factores de expansión
+
+Se manejan varios factores de expansión:
+
+* _fexp_hogar_ para los hogares. La suma es **3,181,246 hogares**.
+* _fexp_per_ para las personas. La suma es **11,253,424 personas**.
+* _fexp_viaje_bruto_, el factor de expansión de las personas aplicadas a los viajes.
+* _fexp_viaje_ el factor de expansión del viaje ajustado por un factor que depende del modo de transporte obtenido a partir de conteos vehiculares. La suma es **24,624,872**.
+
+Sin embargo, encontramos una limitación con estos factores de expansión que al parecer no representan bien la distribución de la población dentro de los distritos. Asimismo, lineas abajo comparamos en una tabla la población de los distritos segun proyecciones del INEI para el año 2024 a partir del censo oficial del 2017 y segun la suma de los factores de expansión _fexp_per_. **Como solución, volvemos a calcular nuevos factores de expansión por distrito a partir de las estimaciones de población 2024 basadas en el censo 2017**.
+
+# Trabajo preliminar
+
+## Paquetes R
+
+```{r Paquetes}
+library(sf)
+library(sfnetworks)
+library(dodgr)
+library(tidygraph)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(TSP)
+library(spatstat)
+library(openxlsx)
+library(ggplot2)
+library(ggspatial)
+library(knitr)
+library(tidyr)
+library(stringr)
+library(RColorBrewer)
+library(foreach)
+library(doFuture)
+library(RColorBrewer)
+library(mapsf)
+library(showtext)
+library(gridGraphics)
+library(grid)
+```
+
+## Cargando los datos del cuestionario
+
+```{r Data}
+Hogares <- read.xlsx("BD_Domiciliaria_Expandida_Procesada_HT.xlsx", sheet = "Hogares")
+Personas <- read.xlsx("BD_Domiciliaria_Expandida_Procesada_HT.xlsx", sheet = "Personas")
+viajes <- read.xlsx("BD_Domiciliaria_Expandida_Procesada_HT.xlsx", sheet = "Viajes")
+
+EF <- read.xlsx("factores de emision lima 2024.xlsx")
+Censo <- read.xlsx("Distritos_pop.xlsx")
+```
+
+## Cargando los datos SHP
+
+Nota: se sigue usando la red vial de 2010 que es la más desarrollada y extensa, sobre todo en zonas periféricas.
+
+```{r Cargando datos SHP}
+Zonas <- st_read(dsn = ".", layer = "zonas") %>% st_transform(4326)
+Zonas_urba <- st_read(dsn = ".", layer = "Zonas_urba") %>% st_transform(4326)
+
+setwd("C:/Users/hugot/Documents/Rennes 2/Calcul distance SIG/Reprise perso/RMD Lima")
+
+manzanas <- st_read(dsn = "Data", layer = "LM_Manzanas_2020")
+limites_lima <- st_read(dsn = "Data", layer = "distritos") %>% st_transform(4326)
+conos_lima <- st_read(dsn = "Data", layer = "Conos") %>% st_transform(4326)
+Routes <- st_read(dsn = "Data", layer = "Reseau_routier_2010")                            # Road network
+Routes <- st_cast(Routes, "LINESTRING") %>% st_transform(4326)
+Metro <- st_read(dsn = "Data", layer = "Metro1_connected")%>% st_transform(4326)          # Metro line 1
+Metro_stops <- st_read(dsn = "Data", layer = "Metro_estaciones")%>% st_transform(4326)    # Metro line 1 stops
+BRT <- st_read(dsn = "Data", layer = "MetropolitanoAlimentador")%>% st_transform(4326)    # BRT network
+BRT_stops <- st_read(dsn = "Data", layer = "MetropolitanoAlimentador_estaciones")%>% st_transform(4326) #BRT stops 
+Bus <- st_read(dsn = "Data", layer = "Bus")%>% st_transform(4326)                         # Bus lines
+Custer <- st_read(dsn = "Data", layer = "Custer")%>% st_transform(4326)                   # Custer lines
+Combi <- st_read(dsn = "Data", layer = "Combi") %>% st_transform(4326)                    # Combi lines
+```
+
+## Procesos preliminares
+
+Se definen las categorías de modos que se usarán dentro del modelo de distancias. También se define una categoría para la comparación con los resultados para Bogotá.
+
+```{r categorias de modos}
+modos <- data.frame(modo_principal_jer = unique(viajes$modo_principal_jer),
+                    modo_principal_typo = c("Custer", "A_pie", "Taxi", "Corredor", "Mototaxi", "Moto", "Combi", "Patineta", "Auto", "Bus", "Alimentador", "Metropolitano", "Tren", "Otro", "Colectivo", "Bicicleta", "Taxi_por_aplicacion", "Trailer", "Camion pequeno", "Camion"),
+                    modo_principal_comparado = c("Transporte público", "A pie", "Taxi / Carro por aplicación", "Transporte público", "Transporte informal", "Moto", "Transporte informal", "Otro", "Auto", "Transporte público", "Transporte público", "Transporte público", "Transporte público", "Otro", "Transporte informal", "Bicicleta", "Taxi / Carro por aplicación", "Otro", "Otro", "Otro"),
+                    modo_principal_LATS = c("Regular bus", "Walking", "Taxi", "Regular bus", "Paratransit", "Moto", "Regular bus", "Other", "Private car", "Regular bus", "Regular bus", "BRT", "Rapid transit", "Other", "Paratransit", "Bike", "Taxi", "Other", "Other", "Other"))
+
+viajes <- viajes %>% left_join(modos, by = "modo_principal_jer")
+```
+
+Excluimos los viajes entrando o saliendo del area conformado por la Provincia de Lima, para la cual tenemos un archivo SHP con la geometría de las zonas. A la fecha, se usa el archivo con las 1,209 Zonas de 2024, y se reduce el número de viajes en la base de 32,448 a 32,373 (-0.2%).
+
+```{r filtro sobre viajes salientes o entrantes}
+viajes <- viajes[viajes$DES_ZONA %in% Zonas$ID_ZONA & viajes$ORI_ZONA %in% Zonas$ID_ZONA,]
+```
+
+Necesitamos restringir la base de hogares a los 6 010 que efectivamente contestaron la encuesta, y luego crear un shapefile a partir de las coordenadas de su lugar de residencia.
+
+```{r calculo de la duracion de viaje}
+viajes$duracion <- viajes$q24_1_hora_llegada+viajes$q24_2_minuto_llegada/60 - (viajes$q21_1_hora_salida+viajes$q21_2_minuto_salida/60)
+```
+
+```{r exclusion de los viajes que tienen un NA en las coordenadas de partida o de llegada}
+# (quita 1 observacion)
+viajes <- viajes[!is.na(viajes$DESLat) & !is.na(viajes$DESLon) & !is.na(viajes$ORILat) & !is.na(viajes$ORILon),]
+```
+
+```{r localización de los hogares}
+Hogares <- Hogares[Hogares$filtro_ini == "Sí" & !(is.na(Hogares$filtro_ini)),]
+Hogares$fexp_hogar <- as.numeric(Hogares$fexp_hogar)
+
+Hogares <- Hogares %>% st_as_sf(coords = c("longitude", "latitude"), crs = 4326) 
+
+
+#st_write(Hogares, "Hogares_loc.shp")
+
+#Definición de la ventana
+zoom_level <- 9.5
+lon_span <- 360 / 2^zoom_level
+lat_span <- 360 / 2^zoom_level
+
+zoom_to_Lima <- c(-76.94, -12.05)  # Lima
+lon_bounds_Lima <- c(zoom_to_Lima[1] - lon_span / 2, zoom_to_Lima[1] + lon_span / 2)
+lat_bounds_Lima <- c(zoom_to_Lima[2] - lat_span / 2, zoom_to_Lima[2] + lat_span / 2)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Zonas, fill = "white")+
+  geom_sf(data = Hogares, col = "red", size = 0.5)+
+  labs(title = "Ubicación de los hogares de la muestra", 
+       subtitle = "Provincia de Lima", 
+       caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023", 
+       col = "UPZ") +
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(x = "", y = "") +
+  theme(legend.position = "right",
+        legend.text = element_text(size=10, hjust = 1),
+        legend.title = element_text(size=15),
+        plot.title = element_text(size=15),
+        plot.caption = element_text(size = 7, face = "italic", hjust = 0, vjust = 12))+
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(0.8, "cm"))
+```
+
+Finalmente necesitamos identificar para cada viaje si sus puntos de origen y destino son el hogar de la persona u otro. Para hacerlo, necesitamos buscar en la base de viajes las variables que contienen estas informaciones. Este procedimiento busca aumentar la precisión de los viajes que comienzan o terminan en el hogar.
+
+```{r viajes que comienzan o terminan en casa}
+#Lugar origen
+colnames(viajes)[colnames(viajes) == "q19_lugar_origen"] <- "lugar_origen"
+viajes$lugar_origen[viajes$lugar_origen != "Residencial (CASA / HOGAR)"] <- "Otro lugar"
+viajes$lugar_origen[viajes$lugar_origen == "Residencial (CASA / HOGAR)"] <- "Hogar"
+
+#Lugar destino
+colnames(viajes)[colnames(viajes) == "q22_lugar_destino"] <- "lugar_destino"
+viajes$lugar_destino[viajes$lugar_destino != "Residencial (CASA / HOGAR)"] <- "Otro lugar"
+viajes$lugar_destino[viajes$lugar_destino == "Residencial (CASA / HOGAR)"] <- "Hogar"
+
+#Control (no debe haber viajes Hogar --> Hogar)
+viajes$test_origen_destino[viajes$lugar_origen == "Hogar" & viajes$lugar_destino == "Hogar"] <- "HOGAR_HOGAR"
+viajes$test_origen_destino[viajes$lugar_origen == "Hogar" & viajes$lugar_destino == "Otro lugar"] <- "HOGAR_Otro"
+viajes$test_origen_destino[viajes$lugar_origen == "Otro lugar" & viajes$lugar_destino == "Hogar"] <- "Otro_HOGAR"
+viajes$test_origen_destino[viajes$lugar_origen == "Otro lugar" & viajes$lugar_destino == "Otro lugar"] <- "Otro_Otro"
+print(table(viajes$test_origen_destino))
+
+```
+
+# Inicialización de las redes
+
+## Red vial
+
+```{r ini red vial dodgr}
+Routes$OBJECTID = NULL
+
+# Ponderación de los segmentos y restricción al principal componente conexo
+net_mot <- weight_streetnet(Routes, wt_profile = "motorcar", type_col = "type")
+net_mot <- net_mot[net_mot$component == 1,]
+net_cycl <- weight_streetnet(Routes, wt_profile = "bicycle", type_col = "type")
+net_cycl <- net_cycl[net_cycl$component == 1,]
+net_walk <- weight_streetnet(Routes, wt_profile = "foot", type_col = "type")
+net_walk <- net_walk[net_walk$component == 1,]
+```
+
+
+## Metro line 1
+
+```{r Metro}
+#Building the network
+net_metro = as_sfnetwork(Metro, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Including (blend) the stations to the network
+net_metro = st_network_blend(net_metro, Metro_stops)
+
+#Computing the new length of each edge 
+net_metro <- net_metro %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+## BRT
+
+```{r BRT}
+BRT <- st_cast(BRT, "LINESTRING")
+BRT_stops <- st_cast(BRT_stops, "POINT")
+
+#Building the network
+net_brt = as_sfnetwork(BRT, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_brt = convert(net_brt, to_spatial_subdivision)
+
+#Including (blend) the stations to the network
+net_brt = st_network_blend(net_brt, BRT_stops)
+
+net_brt <- net_brt %>%
+  activate("nodes") %>%
+  filter(group_components() == 1)
+
+#Computing the new length of each edge 
+net_brt <- net_brt %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+## Bus
+
+```{r Bus}
+Bus <- st_cast(Bus, "LINESTRING")
+
+#Building the network
+net_bus = as_sfnetwork(Bus, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_bus = convert(net_bus, to_spatial_subdivision)
+
+#Computing the new length of each edge 
+net_bus <- net_bus %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+## Custer
+
+```{r Custer}
+Custer <- st_cast(Custer, "LINESTRING")
+
+#Building the network
+net_custer = as_sfnetwork(Custer, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_custer = convert(net_custer, to_spatial_subdivision)
+
+#Computing the new length of each edge
+net_custer <- net_custer %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+## Combi
+
+```{r Combi}
+Combi <- st_cast(Combi, "LINESTRING")
+
+#Building the network
+net_combi = as_sfnetwork(Combi, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length()) %>%
+  activate("nodes") 
+
+#Subdividing edges
+net_combi = convert(net_combi, to_spatial_subdivision)
+
+net_combi <- net_combi %>%
+  activate("nodes") %>%
+  filter(group_components() == 1)
+
+#Computing the new length of each edge
+net_combi <- net_combi %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+
+# Zonificación
+
+Creamos una matriz cuadrangular con malla fina (200 m) y agrupamos las coordenadas de los puntos de origen y destino a nivel de las zonas cuadradas. Este proceso busca acelerar el cálculo de las distancias respeto al metodo de cálculo de punto a punto.
+
+```{r proyección capa zonas}
+#Proyección de la capa de zonas
+Zonas_proj <- Zonas %>% st_transform(32718)
+
+#creacion de capas geometricas con los puntos de partida y de llegada y conversion en coordenadas proyectadas
+ori_viajes <- viajes[,c("id_viaje", "ORILon", "ORILat")] %>% st_as_sf(coords = c("ORILon", "ORILat"), crs = 4326) %>% st_transform(32718)
+dest_viajes <- viajes[,c("id_viaje", "DESLon", "DESLat")] %>% st_as_sf(coords = c("DESLon", "DESLat"), crs = 4326) %>% st_transform(32718)
+```
+
+Malla (metros)	|	Matriz cuadrangular (num puntos)	 |	Matriz reducida (num puntos)
+----------------|------------------------------------|---------------------------------
+		        5000|                                1960|              92
+ 		         500|                              194250|            2647
+ 		         200|                             1213625|            6486
+
+```{r creación de la matriz}
+#Creación de una matriz cuadrangular
+
+cellsize <- 200
+
+matriz <- st_make_grid(
+  Zonas_proj,
+  cellsize = cellsize,
+  crs = 32718,
+  what = "centers",
+  square = TRUE)
+
+matriz <- st_as_sf(matriz)
+matriz$id_grid <- c(1:dim(matriz)[1])
+```
+
+```{r proyeccion de los puntos de origen en la matriz}
+id_ppv_ori <- data.frame(id_grid = st_nearest_feature(ori_viajes, matriz))
+id_ppv_ori$id_viaje <- ori_viajes$id_viaje
+```
+
+```{r proyeccion de los puntos de destino en la matriz}
+id_ppv_dest <- data.frame(id_grid = st_nearest_feature(dest_viajes, matriz))
+id_ppv_dest$id_viaje <- dest_viajes$id_viaje
+```
+
+```{r reducción de la matriz}
+matriz <- matriz[matriz$id_grid %in% id_ppv_ori$id_grid | matriz$id_grid %in% id_ppv_dest$id_grid,]
+
+matriz <- matriz %>% st_transform(4326)
+```
+
+```{r atribución de los id de la matriz a la base de viajes}
+#viajes <- viajes[,1:110]
+viajes <- viajes %>% left_join(id_ppv_ori, by = "id_viaje")
+colnames(viajes)[colnames(viajes) == "id_grid"] <- "id_grid_ori"
+
+viajes <- viajes %>% left_join(id_ppv_dest, by = "id_viaje")
+colnames(viajes)[colnames(viajes) == "id_grid"] <- "id_grid_dest"
+```
+
+
+# Cálculo de las distancias
+
+Se calcula la longitud de cada viaje de acuerdo a los siguiente:
+
+* Se le asigna un modo principal.
+* Se escoge una red de acuerdo al modo principal (ver tabla adjunta) para la asignación del viaje origen-destino.
+* Se calculan las rutas desde el punto de la matriz más cercano al lugar de partida, hasta el punto de la matriz más cercano al lugar de llegada.
+
+Modo principal  | Red empleada
+----------------|-------------------------------------
+Tren eléctrico  | Tren eléctrico
+Metropolitano   | Metropolitano
+Alimentador     | Metropolitano
+Corredores      | Bus
+Bus             | Bus
+Custer          | Custer
+Combi           | Combi
+A pie           | Red vial (ponderación peatón)
+Bicicleta       | Red vial (ponderación ciclista)
+Cualquier otro  | Red vial (ponderación automovilista)
+
+
+```{r Calculo de matrices de distancia, eval = TRUE}
+print(Sys.time())
+
+#5-6 min con malla 500m
+#10 min con malla 200m
+
+#LINEA RECTA (para sustituir NA)
+mat_straight_22 <- as.data.frame(st_distance(x = st_geometry(matriz), y = st_geometry(matriz)))
+rownames(mat_straight_22) <- matriz$id_grid
+colnames(mat_straight_22) <- matriz$id_grid
+mat_straight_22_table <- as.data.frame(as.table(as.matrix(mat_straight_22)))
+colnames(mat_straight_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_straight")
+
+#TREN
+mat_metro_22 <- st_network_cost(net_metro, from = st_geometry(matriz), to = st_geometry(matriz))
+rownames(mat_metro_22) <- matriz$id_grid
+colnames(mat_metro_22) <- matriz$id_grid
+mat_metro_22_table <- as.data.frame(as.table(mat_metro_22))
+colnames(mat_metro_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_metro")
+
+#BRT
+mat_brt_22 <- st_network_cost(net_brt, from = st_geometry(matriz), to = st_geometry(matriz))
+rownames(mat_brt_22) <- matriz$id_grid
+colnames(mat_brt_22) <- matriz$id_grid
+mat_brt_22_table <- as.data.frame(as.table(mat_brt_22))
+colnames(mat_brt_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_brt")
+
+#BUS
+mat_bus_22 <- st_network_cost(net_bus, from = st_geometry(matriz), to = st_geometry(matriz))
+rownames(mat_bus_22) <- matriz$id_grid
+colnames(mat_bus_22) <- matriz$id_grid
+mat_bus_22_table <- as.data.frame(as.table(mat_bus_22))
+colnames(mat_bus_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_bus")
+
+#CUSTER
+mat_custer_22 <- st_network_cost(net_custer, from = st_geometry(matriz), to = st_geometry(matriz))
+rownames(mat_custer_22) <- matriz$id_grid
+colnames(mat_custer_22) <- matriz$id_grid
+mat_custer_22_table <- as.data.frame(as.table(mat_custer_22))
+colnames(mat_custer_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_custer")
+
+#COMBI
+mat_combi_22 <- st_network_cost(net_combi, from = st_geometry(matriz), to = st_geometry(matriz))
+rownames(mat_combi_22) <- matriz$id_grid
+colnames(mat_combi_22) <- matriz$id_grid
+mat_combi_22_table <- as.data.frame(as.table(mat_combi_22))
+colnames(mat_combi_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_combi")
+
+#MOTORIZADO
+mat_mot_22 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(matriz)), shortest = TRUE)
+rownames(mat_mot_22) <- matriz$id_grid
+colnames(mat_mot_22) <- matriz$id_grid
+mat_mot_22[is.na(mat_mot_22)] <- mat_straight_22[is.na(mat_mot_22)]
+mat_mot_22_table <- as.data.frame(as.table(mat_mot_22))
+colnames(mat_mot_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_car")
+
+#BICI
+mat_cycl_22 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(matriz)), shortest = TRUE)
+rownames(mat_cycl_22) <- matriz$id_grid
+colnames(mat_cycl_22) <- matriz$id_grid
+mat_cycl_22[is.na(mat_cycl_22)] <- mat_straight_22[is.na(mat_cycl_22)]
+mat_cycl_22_table <- as.data.frame(as.table(mat_cycl_22))
+colnames(mat_cycl_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_bike")
+
+#WALK
+mat_walk_22 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(matriz)), shortest = TRUE)
+rownames(mat_walk_22) <- matriz$id_grid
+colnames(mat_walk_22) <- matriz$id_grid
+mat_walk_22[is.na(mat_walk_22)] <- mat_straight_22[is.na(mat_walk_22)]
+mat_walk_22_table <- as.data.frame(as.table(mat_walk_22))
+colnames(mat_walk_22_table) <- c("id_grid_ori", "id_grid_dest", "dist_walk")
+
+print(Sys.time())
+```
+
+```{r Unión con las bases de viajes, eval = TRUE}
+viajes_dist <- viajes[,c("id_viaje", "id_per", "id_hogar", "lugar_origen", "lugar_destino", "id_grid_ori", "id_grid_dest", "fexp_viaje", "duracion", "modo_principal_typo", "modo_principal_comparado", "test_origen_destino")]
+
+#Unión por columnas múltiples 
+#1 min con malla 500m
+#6 min con malla 200m
+
+print(Sys.time())
+
+viajes_dist <- merge(viajes_dist, mat_mot_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_cycl_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_walk_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_metro_22_table, by = c("id_grid_ori", "id_grid_dest"))
+
+viajes_dist <- merge(viajes_dist, mat_brt_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_bus_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_custer_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_combi_22_table, by = c("id_grid_ori", "id_grid_dest")) 
+
+viajes_dist <- merge(viajes_dist, mat_straight_22_table, by = c("id_grid_ori", "id_grid_dest"))
+
+print(Sys.time())
+
+#write.xlsx(viajes_dist, "viajes_dist_no_corr_matriz_200.xlsx")
+```
+
+```{r Asignacion distancia por modo}
+viajes_dist <- read.xlsx("Tablas producidas/viajes_dist_no_corr_matriz_200.xlsx")
+
+viajes_dist$Distancia <- viajes_dist$dist_car
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "A_pie"] <- viajes_dist$dist_walk[viajes_dist$modo_principal_typo == "A_pie"]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo %in% c("Bicicleta")] <- viajes_dist$dist_bike[viajes_dist$modo_principal_typo %in% c("Bicicleta")]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo %in% c("Alimentador", "Metropolitano")] <- viajes_dist$dist_brt[viajes_dist$modo_principal_typo %in% c("Alimentador", "Metropolitano")]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "Tren"] <- viajes_dist$dist_metro[viajes_dist$modo_principal_typo == "Tren"]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo %in% c("Bus", "Corredor")] <- viajes_dist$dist_bus[viajes_dist$modo_principal_typo %in% c("Bus", "Corredor")]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "Custer"] <- viajes_dist$dist_custer[viajes_dist$modo_principal_typo == "Custer"]
+
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "Combi"] <- viajes_dist$dist_combi[viajes_dist$modo_principal_typo == "Combi"]
+
+viajes_dist$Distancia[is.na(viajes_dist$Distancia)] <- viajes_dist$dist_straight[is.na(viajes_dist$Distancia)]
+
+viajes_dist$Distancia <- as.numeric(viajes_dist$Distancia)
+```
+
+Para los viajes cuyo modo principal es el transporte colectivo (Tren, BRT, bus, combi, cúster), añadimos las distancias hasta y desde los paraderos. 
+
+```{r distancia hasta y desde el metro}
+plot(net_metro)
+
+#Conversion de nudos de la red en formato sf. Incluye las 26 estaciones
+acceso_metro <- net_metro %>%
+  activate("nodes") %>%
+  st_geometry() %>%
+  st_as_sf()
+
+#Matriz de distancias a pie entre puntos de la matriz y estaciones
+mat_walk_matriz_metro <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(acceso_metro)), shortest = TRUE)
+rownames(mat_walk_matriz_metro) <- matriz$id_grid
+colnames(mat_walk_matriz_metro) <- rownames(acceso_metro)
+
+#Búsqueda de la estación de metro más cercana a cada punto de la matriz
+distancia <- apply(mat_walk_matriz_metro[,1:dim(mat_walk_matriz_metro)[2]], FUN = min, MARGIN = 1)
+name <- data.frame(name = colnames(mat_walk_matriz_metro)[apply(mat_walk_matriz_metro, 1, function(x) which(x == min(x))[1])])
+estacion_mas_cerca_matriz <- cbind(name, distancia)
+estacion_mas_cerca_matriz$id_grid <- as.numeric(rownames(estacion_mas_cerca_matriz))
+
+#Adición de la distancia hasta y desde el metro en los viajes con este modo
+matriz_metro <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_ori" = "id_grid")) %>%
+  group_by(id_grid_ori) %>%
+  summarize(dist_matriz_metro = unique(distancia))
+
+metro_matriz <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_dest" = "id_grid")) %>%
+  group_by(id_grid_dest) %>%
+  summarize(dist_metro_matriz = unique(distancia))
+
+viajes_dist <- viajes_dist %>% 
+  left_join(matriz_metro, by = "id_grid_ori") %>%
+  left_join(metro_matriz, by = "id_grid_dest")
+
+viajes_dist$dist_metro_incl_caminata <- as.numeric(viajes_dist$dist_metro) + viajes_dist$dist_matriz_metro + viajes_dist$dist_metro_matriz
+```
+
+```{r distancia hasta y desde el BRT}
+plot(net_brt)
+
+#Conversion de nudos de la red en formato sf. Incluye las 351 estaciones y paraderos del Metropolitano+Alimentador más 1 070 nudos de las rutas de Alimentación que no pudieron ser evitados en la construcción de la red.
+acceso_brt <- net_brt %>%
+  activate("nodes") %>%
+  st_geometry() %>%
+  st_as_sf()
+
+#Matriz de distancias a pie entre puntos de la matriz y estaciones
+mat_walk_matriz_brt <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(acceso_brt)), shortest = TRUE)
+rownames(mat_walk_matriz_brt) <- matriz$id_grid
+colnames(mat_walk_matriz_brt) <- rownames(acceso_brt)
+
+#Búsqueda de la estación de brt más cercana a cada punto de la matriz
+distancia <- apply(mat_walk_matriz_brt[,1:dim(mat_walk_matriz_brt)[2]], FUN = min, MARGIN = 1)
+name <- data.frame(name = colnames(mat_walk_matriz_brt)[apply(mat_walk_matriz_brt, 1, function(x) which(x == min(x))[1])])
+estacion_mas_cerca_matriz <- cbind(name, distancia)
+estacion_mas_cerca_matriz$id_grid <- as.numeric(rownames(estacion_mas_cerca_matriz))
+
+#Adición de la distancia hasta y desde el brt en los viajes con este modo
+matriz_brt <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_ori" = "id_grid")) %>%
+  group_by(id_grid_ori) %>%
+  summarize(dist_matriz_brt = unique(distancia))
+
+brt_matriz <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_dest" = "id_grid")) %>%
+  group_by(id_grid_dest) %>%
+  summarize(dist_brt_matriz = unique(distancia))
+
+viajes_dist <- viajes_dist %>% 
+  left_join(matriz_brt, by = "id_grid_ori") %>%
+  left_join(brt_matriz, by = "id_grid_dest")
+
+viajes_dist$dist_brt_incl_caminata <- as.numeric(viajes_dist$dist_brt) + viajes_dist$dist_matriz_brt + viajes_dist$dist_brt_matriz
+```
+
+```{r distancia hasta y desde el bus}
+#Conversion de nudos de la red en formato sf. Incluye los 12 192 nudos de la red de bus.
+acceso_bus <- net_bus %>%
+  activate("nodes") %>%
+  st_geometry() %>%
+  st_as_sf()
+
+plot(acceso_bus)
+
+#Matriz de distancias a pie entre puntos de la matriz y estaciones
+mat_walk_matriz_bus <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(acceso_bus)), shortest = TRUE)
+rownames(mat_walk_matriz_bus) <- matriz$id_grid
+colnames(mat_walk_matriz_bus) <- rownames(acceso_bus)
+
+#Búsqueda de la estación de bus más cercana a cada punto de la matriz
+distancia <- apply(mat_walk_matriz_bus[,1:dim(mat_walk_matriz_bus)[2]], FUN = min, MARGIN = 1)
+name <- data.frame(name = colnames(mat_walk_matriz_bus)[apply(mat_walk_matriz_bus, 1, function(x) which(x == min(x))[1])])
+estacion_mas_cerca_matriz <- cbind(name, distancia)
+estacion_mas_cerca_matriz$id_grid <- as.numeric(rownames(estacion_mas_cerca_matriz))
+
+#Adición de la distancia hasta y desde el bus en los viajes con este modo
+matriz_bus <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_ori" = "id_grid")) %>%
+  group_by(id_grid_ori) %>%
+  summarize(dist_matriz_bus = unique(distancia))
+
+bus_matriz <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_dest" = "id_grid")) %>%
+  group_by(id_grid_dest) %>%
+  summarize(dist_bus_matriz = unique(distancia))
+
+viajes_dist <- viajes_dist %>% 
+  left_join(matriz_bus, by = "id_grid_ori") %>%
+  left_join(bus_matriz, by = "id_grid_dest")
+
+viajes_dist$dist_bus_incl_caminata <- as.numeric(viajes_dist$dist_bus) + viajes_dist$dist_matriz_bus + viajes_dist$dist_bus_matriz
+```
+
+```{r distancia hasta y desde la custer}
+#Conversion de nudos de la red en formato sf. Incluye los 15 989 nudos de la red de custer.
+acceso_custer <- net_custer %>%
+  activate("nodes") %>%
+  st_geometry() %>%
+  st_as_sf()
+
+plot(acceso_custer)
+
+#Matriz de distancias a pie entre puntos de la matriz y estaciones
+mat_walk_matriz_custer <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(acceso_custer)), shortest = TRUE)
+rownames(mat_walk_matriz_custer) <- matriz$id_grid
+colnames(mat_walk_matriz_custer) <- rownames(acceso_custer)
+
+#Búsqueda de la estación de custer más cercana a cada punto de la matriz
+distancia <- apply(mat_walk_matriz_custer[,1:dim(mat_walk_matriz_custer)[2]], FUN = min, MARGIN = 1)
+name <- data.frame(name = colnames(mat_walk_matriz_custer)[apply(mat_walk_matriz_custer, 1, function(x) which(x == min(x))[1])])
+estacion_mas_cerca_matriz <- cbind(name, distancia)
+estacion_mas_cerca_matriz$id_grid <- as.numeric(rownames(estacion_mas_cerca_matriz))
+
+#Adición de la distancia hasta y desde el custer en los viajes con este modo
+matriz_custer <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_ori" = "id_grid")) %>%
+  group_by(id_grid_ori) %>%
+  summarize(dist_matriz_custer = unique(distancia))
+
+custer_matriz <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_dest" = "id_grid")) %>%
+  group_by(id_grid_dest) %>%
+  summarize(dist_custer_matriz = unique(distancia))
+
+viajes_dist <- viajes_dist %>% 
+  left_join(matriz_custer, by = "id_grid_ori") %>%
+  left_join(custer_matriz, by = "id_grid_dest")
+
+viajes_dist$dist_custer_incl_caminata <- as.numeric(viajes_dist$dist_custer) + viajes_dist$dist_matriz_custer + viajes_dist$dist_custer_matriz
+```
+
+```{r distancia hasta y desde la combi}
+#Conversion de nudos de la red en formato sf. Incluye los 11 797 nudos de la red de combi.
+acceso_combi <- net_combi %>%
+  activate("nodes") %>%
+  st_geometry() %>%
+  st_as_sf()
+
+plot(acceso_combi)
+
+#Matriz de distancias a pie entre puntos de la matriz y estaciones
+mat_walk_matriz_combi <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(matriz)), to = as.data.frame(st_coordinates(acceso_combi)), shortest = TRUE)
+rownames(mat_walk_matriz_combi) <- matriz$id_grid
+colnames(mat_walk_matriz_combi) <- rownames(acceso_combi)
+
+#Búsqueda de la estación de combi más cercana a cada punto de la matriz
+distancia <- apply(mat_walk_matriz_combi[,1:dim(mat_walk_matriz_combi)[2]], FUN = min, MARGIN = 1)
+name <- data.frame(name = colnames(mat_walk_matriz_combi)[apply(mat_walk_matriz_combi, 1, function(x) which(x == min(x))[1])])
+estacion_mas_cerca_matriz <- cbind(name, distancia)
+estacion_mas_cerca_matriz$id_grid <- as.numeric(rownames(estacion_mas_cerca_matriz))
+
+#Adición de la distancia hasta y desde el combi en los viajes con este modo
+matriz_combi <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_ori" = "id_grid")) %>%
+  group_by(id_grid_ori) %>%
+  summarize(dist_matriz_combi = unique(distancia))
+
+combi_matriz <- viajes_dist %>% left_join(estacion_mas_cerca_matriz[,c("id_grid", "distancia")], by = c("id_grid_dest" = "id_grid")) %>%
+  group_by(id_grid_dest) %>%
+  summarize(dist_combi_matriz = unique(distancia))
+
+viajes_dist <- viajes_dist %>% 
+  left_join(matriz_combi, by = "id_grid_ori") %>%
+  left_join(combi_matriz, by = "id_grid_dest")
+
+viajes_dist$dist_combi_incl_caminata <- as.numeric(viajes_dist$dist_combi) + viajes_dist$dist_matriz_combi + viajes_dist$dist_combi_matriz
+```
+
+```{r distancia incluyendo la caminata inicial y final}
+viajes_dist$Distancia_incl_caminata <- viajes_dist$Distancia
+
+viajes_dist$Distancia_incl_caminata[viajes_dist$modo_principal_typo == "Tren"] <- viajes_dist$dist_metro_incl_caminata[viajes_dist$modo_principal_typo == "Tren"]
+
+viajes_dist$Distancia_incl_caminata[viajes_dist$modo_principal_typo %in% c("Alimentador", "Metropolitano")] <- viajes_dist$dist_brt_incl_caminata[viajes_dist$modo_principal_typo %in% c("Alimentador", "Metropolitano")]
+
+viajes_dist$Distancia_incl_caminata[viajes_dist$modo_principal_typo %in% c("Bus", "Corredor")] <- viajes_dist$dist_bus_incl_caminata[viajes_dist$modo_principal_typo %in% c("Bus", "Corredor")]
+
+viajes_dist$Distancia_incl_caminata[viajes_dist$modo_principal_typo == "Custer"] <- viajes_dist$dist_custer_incl_caminata[viajes_dist$modo_principal_typo == "Custer"]
+
+viajes_dist$Distancia_incl_caminata[viajes_dist$modo_principal_typo == "Combi"] <- viajes_dist$dist_combi_incl_caminata[viajes_dist$modo_principal_typo == "Combi"]
+```
+
+Hallamos la distancia promedio desde cada red hasta los puntos de la matriz (con resolución 200m).
+
+```{r comparacion distancias a los distintos puntos de acceso a las redes}
+comparacion <- data.frame(red = c("Tren", "BRT", "Bus", "Custer", "Combi"),
+                          dist_promedio_desde_matriz = c(mean(metro_matriz$dist_metro_matriz),
+                                                         mean(brt_matriz$dist_brt_matriz),
+                                                         mean(bus_matriz$dist_bus_matriz),
+                                                         mean(custer_matriz$dist_custer_matriz),
+                                                         mean(combi_matriz$dist_combi_matriz)),
+                          dist_mediana_desde_matriz = c(median(metro_matriz$dist_metro_matriz),
+                                                        median(brt_matriz$dist_brt_matriz),
+                                                        median(bus_matriz$dist_bus_matriz),
+                                                        median(custer_matriz$dist_custer_matriz),
+                                                        median(combi_matriz$dist_combi_matriz)))
+
+colnames(comparacion) <- c("Red", "Promedio", "Mediana")
+
+kable(comparacion, caption = "Comparación de las distancias entre los puntos de la matriz (200m) y las redes de transporte colectivo", format.args = list(big.mark = ","))
+```
+
+Para los viajes intrazona, se decide no abordarlos, dado que se requeriría tener un shape con las geometrías de las zonas con clase POLYGON y no POINT. Consideramos que la malla que escogimos es lo suficiente fina para que no haya un número importante de viajes intrazona. De hecho, representan 893 viajes (el 2.7% total).
+
+Identificamos los viajes de ida y vuelta. Un viaje de ida y vuelta se identifica porque cumple las siguientes características:
+
+* Se buscan tales viajes dentro del conjunto de viajes realizados por una misma persona identificada por su _id_per_. 
+* Para cada persona, creamos una submuestra correspondiente a los potenciales viajes "de ida", que son los que originan en su casa, y otra submuesta correspondiente a los potenciales viajes "de vuelta".
+* Se unen las dos submuestras por _id_per_ y se comparan el modo de los dos viajes (deben coincidir para que sea ida y vuelta), el lugar de destino del viaje de ida y el lugar de origen del viaje de regreso (deben coincidir para que sea ida y vuelta).
+* Finalmente, se crea una variable dummy en la base de viajes completa indicando si cada viaje es parte de una ida y vuelta o no.
+
+Nota: dado que no pudimos identificar todos los viajes que inician en el hogar, sino solo el primero del día, este algoritmo solo puede detectar máximo una ida y vuelta por persona.
+
+```{r identificación ida y vuelta, eval = TRUE}
+#Esta etapa es necesaria en el marco del control de velocidad de la siguiente etapa. Se define como ida y vuelta un trayecto casa -> cierto lugar -> casa realizado con el mismo modo de transporte. El lugar de destino del primer viaje y el lugar de origen del segundo deben coincidir. Si el modo de transporte cambia, no lo definimos como ida y vuelta.
+
+ida <- viajes_dist[viajes_dist$lugar_origen == "Hogar", c("id_per", "id_viaje", "lugar_destino", "modo_principal_typo")]
+vuelta <- viajes_dist[viajes_dist$lugar_destino == "Hogar", c("id_per", "id_viaje", "lugar_origen", "modo_principal_typo")]
+ida_vuelta <- na.omit(ida %>% left_join(vuelta, by = "id_per"))
+ida_vuelta$is_ida_vuelta <- (ida_vuelta$lugar_destino == ida_vuelta$lugar_origen) & (ida_vuelta$modo_principal_typo.x == ida_vuelta$modo_principal_typo.y)
+ida <- ida_vuelta[,c("id_viaje.x", "is_ida_vuelta")]
+colnames(ida)[colnames(ida) == "id_viaje.x"] <- "id_viaje"
+ida <- ida %>% group_by(id_viaje) %>% summarize(is_ida_vuelta = as.logical(max(is_ida_vuelta)))
+vuelta <- ida_vuelta[,c("id_viaje.y", "is_ida_vuelta")]
+colnames(vuelta)[colnames(vuelta) == "id_viaje.y"] <- "id_viaje"
+vuelta <- vuelta %>% group_by(id_viaje) %>% summarize(is_ida_vuelta = as.logical(max(is_ida_vuelta)))
+viajes_dist <- viajes_dist %>% left_join(ida, by = c("id_viaje"))
+viajes_dist <- viajes_dist %>% left_join(vuelta, by = c("id_viaje"))
+viajes_dist$is_ida_vuelta.x[is.na(viajes_dist$is_ida_vuelta.x)] <- FALSE
+viajes_dist$is_ida_vuelta.y[is.na(viajes_dist$is_ida_vuelta.y)] <- FALSE
+viajes_dist$is_ida_vuelta <- viajes_dist$is_ida_vuelta.x | viajes_dist$is_ida_vuelta.y
+viajes_dist$is_ida_vuelta.x <- NULL
+viajes_dist$is_ida_vuelta.y <- NULL
+```
+ 
+```{r Control velocidad, eval = TRUE}
+viajes_dist$duracion_min <- 60*viajes_dist$duracion
+
+#velocidad en km/h
+viajes_dist$velocidad <- 60*viajes_dist$Distancia/(1000*viajes_dist$duracion_min)
+
+#825 viajes a pie son demasiado rápidos (9%)
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "A_pie" & viajes_dist$velocidad > 10] <- 1000*viajes_dist$duracion_min[viajes_dist$modo_principal_typo == "A_pie" & viajes_dist$velocidad > 10]*10/60
+
+#5 viajes en bici son demasiado rápidos (2.7%)
+viajes_dist$Distancia[viajes_dist$modo_principal_typo == "Bicicleta" & viajes_dist$velocidad > 30] <- 1000*viajes_dist$duracion_min[viajes_dist$modo_principal_typo == "Bicicleta" & viajes_dist$velocidad > 30]*30/60
+
+#501 viajes en modos motorizados son demasiado rápidos (2.2%)
+viajes_dist$Distancia[!(viajes_dist$modo_principal_typo %in% c("A_pie","Bicicleta")) & viajes_dist$velocidad > 50] <- 1000*viajes_dist$duracion_min[!(viajes_dist$modo_principal_typo %in% c("A_pie","Bicicleta")) & viajes_dist$velocidad > 50]*50/60
+
+#se aplica una ultima correccion: los viajes de ida y vuelta deben tener la misma distancia. Se corrige la distancia de los viajes demasiado rápidos, pero en el caso de los viajes de ida y vuelta, dado que esperamos que la distancia coincida en la ida y el regreso, le vamos a asignar el maximo entre los dos valores.
+ida_vuelta <- viajes_dist[viajes_dist$is_ida_vuelta == TRUE,] %>% 
+  group_by(id_per, modo_principal_typo) %>%
+  summarise(Distancia_AR = max(Distancia))
+viajes_dist <- viajes_dist %>% left_join(ida_vuelta, by = c("id_per", "modo_principal_typo"))
+viajes_dist$Distancia[viajes_dist$is_ida_vuelta == TRUE] <- viajes_dist$Distancia_AR[viajes_dist$is_ida_vuelta == TRUE]
+viajes_dist$Distancia_AR <- NULL
+viajes_dist$velocidad <- NULL
+```
+
+Por fin podemos crear la base final con las variables correspondientes a distancia, emisiones de gases de efecto invernadero y contaminantes aéreos.
+
+```{r Base final}
+viajes_dist <- viajes_dist %>% left_join(EF, by = "modo_principal_typo")
+viajes_dist$v_moy = NULL
+
+viajes_dist$`CO2-eq` <- viajes_dist$`CO2-eq`*viajes_dist$Distancia/1000
+viajes_dist$CO <- viajes_dist$CO*viajes_dist$Distancia/1000
+viajes_dist$NOx <- viajes_dist$NOx*viajes_dist$Distancia/1000
+viajes_dist$BC <- viajes_dist$BC*viajes_dist$Distancia/1000
+viajes_dist$COV <- viajes_dist$COV*viajes_dist$Distancia/1000
+viajes_dist$PM <- viajes_dist$PM*viajes_dist$Distancia/1000
+```
+
+## Actualización población
+
+Evidenciamos problemas con los factores de expansión de la población de la encuesta 2023. Algunos distritos tienen sobrestimada su población total mientras que otros la tienen subestimada, respeto a la proyección del INEI para 2024.
+
+También hay un problema con el muestreo, la mitad de las zonas no habiendo sido muestreadas. Como consecuencia, la encuesta no es respresentativa a nivel de zonas y solo puede alcanzar a serlo a nivel de distritos. Por lo tanto, adoptamos dos soluciones:
+
+* Sustituir las zonas por distritos.
+* Volver a calcular los factores de expansión de las personas, hogares y viajes tomando en cuenta el cambio de zonificación de zonas a distritos y [las proyecciones demográficas del INEI para el 2024 basadas en el censo de 2017](https://www.cpi.pe/images/upload/paginaweb/archivo/23/PER%C3%9A%20POBLACI%C3%93N%202024.pdf).
+
+```{r debug 1}
+viajes_dist <- as.data.frame(viajes_dist)
+write.xlsx(viajes_dist, "debug viajes 1.xlsx")
+```
+
+```{r preliminar}
+Hogares$distrito[Hogares$distrito == "BREÑA"] <- "BRENA"
+Hogares$distrito[Hogares$distrito == "ATE"] <- "ATE VITARTE"
+Hogares$distrito[Hogares$distrito == "MI PERÚ"] <- "MI PERU"
+
+Hogares <- Hogares %>% st_join(Zonas[,c("ID_ZONA")])
+
+Personas_indic <- Personas %>% 
+  left_join(Hogares[,c("id_hog", "ID_ZONA")], by = "id_hog")%>%
+  group_by(ID_ZONA) %>%
+  summarise(pop = sum(fexp_per))
+
+Hogares_flat <- Hogares %>% st_drop_geometry()
+
+viajes_dist <- viajes_dist %>% left_join(Hogares_flat[,c("id_hog", "distrito")], by = c("id_hogar" = "id_hog"))
+
+Zonas_urba <- Zonas_urba %>% left_join(Personas_indic, by = "ID_ZONA")
+```
+
+```{r debug 2}
+viajes_dist <- as.data.frame(viajes_dist)
+write.xlsx(viajes_dist, "debug viajes 3.xlsx")
+```
+
+```{r poblacion por distrito censo 2017 y proyecciones 2024, eval = TRUE}
+#calculamos la población por distrito segun el censo del 2017. Exportamos el archivo en formato Excel. Fuera de R, creamos una nueva columna con la población de los distritos proyectada al 2024.
+#Censo <- manzanas %>% st_drop_geometry() %>% group_by(DISTRITO) %>% summarize(pop_censo_2017 = sum(POBLACION))
+
+#write.xlsx(Censo, "Distritos_pop.xlsx")
+Censo <- read.xlsx("Distritos_pop.xlsx")
+```
+
+## Comparación de la población por distrito segun segun encuesta 2023 y proyecciones INEI 2024
+
+```{r poblacion por distrito encuesta 2023}
+Distritos <- Zonas_urba %>% 
+  group_by(distrito) %>% 
+  summarise(pop_enc_2023 = sum(pop, na.rm = TRUE))
+
+Distritos$distrito[Distritos$distrito == "BREŃA"] <- "BRENA"
+Distritos$distrito[Distritos$distrito == "CARMEN DE LA LEGUA"] <- "CARMEN DE LA LEGUA REYNOSO"
+```
+
+```{r poblacion comparada}
+Distritos <- Distritos %>% left_join(Censo[,c("DISTRITO", "pop_est_2024")], by = c("distrito" = "DISTRITO"))
+Distritos$variacion <- 100*(Distritos$pop_enc_2023-Distritos$pop_est_2024)/Distritos$pop_est_2024
+
+Distritos <- Distritos[order(Distritos$variacion, decreasing = TRUE),]
+
+total <- data.frame("TOTAL", 
+                   sum(Distritos$pop_enc_2023), 
+                   sum(Distritos$pop_est_2024),
+                   100*(sum(Distritos$pop_enc_2023)-sum(Distritos$pop_est_2024))/sum(Distritos$pop_est_2024))
+
+Distritos_table <- st_drop_geometry(Distritos)
+
+colnames(total) <- colnames(Distritos_table)
+
+Distritos_table <- rbind(Distritos_table, total)
+
+Distritos_table$pop_enc_2023 <- round(Distritos_table$pop_enc_2023, 0)
+
+colnames(Distritos_table) <- c("Distrito", "Población encuesta ATU 2023", "Población proyectada INEI 2024", "% Variación")
+
+kable(Distritos_table, caption = "Población por distrito", format.args = list(big.mark = ","))
+
+#st_write(Distritos, "Distritos.shp")
+```
+
+## Nuevos factores de expansión
+
+Para actualizar el factor de expansión de las personas:
+
+* Le atribuimos un distrito de residencia a cada persona por unión con la base de hogares.
+* Hacemos la suma del número de personas entrevistadas dentro de cada distrito.
+* Finalmente, calculamos el factor de expansión de cada persona como el cociente entre el número de personas estimado dentro del distrito con el número de personas entrevistadas en el distrito.
+
+Finalmente, todas las personas encuestadas dentro de un mismo distrito tendrán el mismo factor de expansión.
+
+Para actualizar el factor de expansión de los hogares (no lo usaremos, solo será para fines informativos), le atribuimos a cada hogar el nuevo factor de expansión único de sus miembros. La nueva suma de los factores de expansión de los hogares ahora asciende a 3,570,012, mientras que la proyección del INEI para el 2024 es inferior con un valor de 2,813,100. Esto se debe a la calidad del muestreo inicial, que no pudo controlar a la vez la distribución de los hogares y la distribución de las personas dentro de los mismos.
+
+Para actualizar el factor de expansión de los viajes, sustituimos el factor bruto por el nuevo factor de expansión de la persona y lo multiplicamos por el factor de ajuste modal.
+
+```{r nuevo fexp personas, eval = TRUE}
+#Distrito de referencia y cálculo del número de personas entrevistadas dentro de cada distrito
+Personas <- Personas %>% left_join(Hogares[,c("id_hog", "distrito")], by = "id_hog")
+Personas_por_distrito <- Personas %>% group_by(distrito) %>% summarise(num_pers_distrito = n()) %>%
+  left_join(st_drop_geometry(Distritos[,c("distrito", "pop_est_2024")]), by = "distrito")
+
+#Cálculo de los nuevos factores de expansión
+Personas_por_distrito$fexp_per_nuevo <- Personas_por_distrito$pop_est_2024/Personas_por_distrito$num_pers_distrito
+Personas <- Personas %>% left_join(Personas_por_distrito[,c("distrito", "fexp_per_nuevo")], by = "distrito")
+```
+
+```{r nuevo fexp hogares, eval = TRUE}
+#Cálculo del número de personas por hogar
+Personas_por_hog <- Personas %>% group_by(id_hog) %>% summarise(num_pers_hog = n(), fexp_hogar_nuevo = unique(fexp_per_nuevo))
+Hogares <- Hogares %>% left_join(Personas_por_hog, by = "id_hog")
+```
+
+```{r nuevo fexp viajes, eval = TRUE}
+#Unión con la base de personas para tener el factor de viaje bruto
+viajes <- viajes %>% left_join(Personas[,c("id_pers", "fexp_per_nuevo")], by = c("id_per" = "id_pers"))
+
+#Ajuste segun el modo
+viajes$fexp_viaje_nuevo <- viajes$fexp_per_nuevo*viajes$f_ajust
+
+viajes_dist <- viajes_dist[,1:47] %>% left_join(viajes[,c("id_viaje", "fexp_viaje_nuevo")], by = "id_viaje")
+
+#write.xlsx(viajes_dist, paste0("viajes_dist_final_matriz_con_caminata_previa.xlsx"), overwrite = TRUE)
+```
+
+# Estadísticas
+
+Las estadísticas quedan así, con modos desagrupados y agrupados para comparación con Bogotá. 
+
+NOTA IMPORTANTE PARA LOS VIAJES CUYO MODO PRINCIPAL ES UN MODO COLECTIVO:
+
+* Incluimos la demanda (PKT) solo para el tramo con el modo principal, para información, lo cual permite darse cuenta de que incluir la caminata al inicio y al final del viaje, aumenta los PKT totales por un 12.7%.
+
+* Las emisiones de GEI se calculan con el valor de la distancia correspondiente al tramo con el modo principal, así los tramos caminados al inicio y al final del viaje no afectan este valor.
+
+* La distancia media por viaje sí incluye los tramos caminados iniciales y finales.
+
+```{r stat modos}
+viajes_dist <- read.xlsx("Tablas producidas/viajes_dist_final_matriz_con_caminata_previa.xlsx")
+
+estadisticas <- viajes_dist %>% 
+  group_by(modo_principal_typo) %>% 
+  summarize(numero_viajes = round(sum(fexp_viaje_nuevo),0), 
+            mpkt = sum(fexp_viaje_nuevo*Distancia/1000000000),
+            mpkt_incl_caminata = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000000000),
+            reparto_modal = 100*sum(fexp_viaje_nuevo)/sum(viajes_dist$fexp_viaje_nuevo), 
+            reparto_modal_pkt = 100*sum(fexp_viaje_nuevo*Distancia_incl_caminata)/sum(viajes_dist$fexp_viaje_nuevo*viajes_dist$Distancia_incl_caminata), 
+            `CO2-eq`= sum(fexp_viaje_nuevo*`CO2-eq`/1000000),
+            dist_por_viaje = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000)/sum(fexp_viaje_nuevo),
+            duracion_por_viaje = sum(fexp_viaje_nuevo*duracion_min)/sum(fexp_viaje_nuevo))
+  
+estadisticas <- estadisticas[order(estadisticas$numero_viajes, decreasing = TRUE),]
+
+#write.xlsx(estadisticas, "estadisticas_modos_lima_2023.xlsx")
+
+total <- data.frame("TOTAL", 
+                   sum(estadisticas$numero_viajes),
+                   sum(estadisticas$mpkt),
+                   sum(estadisticas$mpkt_incl_caminata),
+                   sum(estadisticas$reparto_modal),
+                   sum(estadisticas$reparto_modal_pkt),
+                   sum(estadisticas$`CO2-eq`),
+                   sum(estadisticas$numero_viajes*estadisticas$dist_por_viaje)/sum(estadisticas$numero_viajes),
+                   sum(estadisticas$numero_viajes*estadisticas$duracion_por_viaje)/sum(estadisticas$numero_viajes))
+
+colnames(total) <- colnames(estadisticas)
+
+estadisticas <- rbind(estadisticas, total)
+
+colnames(estadisticas) <- c("Modo principal","Número de viajes","Millón PKT (solo tramo principal)", "Millón PKT (total incluyendo caminata inicial y final)","% Número de viajes","% PKT","Emisiones GEI (tCO2-eq)", "Distancia media por viaje (km)", "Duracion media por viaje (min)")
+
+kable(estadisticas, caption = "Estadísticas por modo", format.args = list(big.mark = ","), digits = 1)
+```
+
+```{r stat motivos}
+motivos <- data.frame(q25_proposito = unique(viajes$q25_proposito),
+                      motivo = c("Estudio", "Trabajo", "Retorno a casa", "Otro", "Compras", "Otro", "Acompañamiento", "Otro", "Compras"))
+
+viajes_dist <- viajes_dist %>%
+  left_join(viajes[,c("id_viaje", "q25_proposito")], by = "id_viaje") %>% 
+  left_join(motivos, by = "q25_proposito")
+
+estadisticas <- viajes_dist %>% 
+  group_by(motivo) %>% 
+  summarize(numero_viajes = round(sum(fexp_viaje_nuevo),0), 
+            mpkt = sum(fexp_viaje_nuevo*Distancia/1000000000),
+            mpkt_incl_caminata = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000000000),
+            reparto_modal = 100*sum(fexp_viaje_nuevo)/sum(viajes_dist$fexp_viaje_nuevo), 
+            reparto_modal_pkt = 100*sum(fexp_viaje_nuevo*Distancia_incl_caminata)/sum(viajes_dist$fexp_viaje_nuevo*viajes_dist$Distancia_incl_caminata), 
+            `CO2-eq`= sum(fexp_viaje_nuevo*`CO2-eq`/1000000),
+            dist_por_viaje = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000)/sum(fexp_viaje_nuevo),
+            duracion_por_viaje = sum(fexp_viaje_nuevo*duracion_min)/sum(fexp_viaje_nuevo))
+  
+estadisticas <- estadisticas[order(estadisticas$numero_viajes, decreasing = TRUE),]
+
+#write.xlsx(estadisticas, "estadisticas_motivos_lima_2023.xlsx")
+
+total <- data.frame("TOTAL", 
+                   sum(estadisticas$numero_viajes),
+                   sum(estadisticas$mpkt),
+                   sum(estadisticas$mpkt_incl_caminata),
+                   sum(estadisticas$reparto_modal),
+                   sum(estadisticas$reparto_modal_pkt),
+                   sum(estadisticas$`CO2-eq`),
+                   sum(estadisticas$numero_viajes*estadisticas$dist_por_viaje)/sum(estadisticas$numero_viajes),
+                   sum(estadisticas$numero_viajes*estadisticas$duracion_por_viaje)/sum(estadisticas$numero_viajes))
+
+colnames(total) <- colnames(estadisticas)
+
+estadisticas <- rbind(estadisticas, total)
+
+colnames(estadisticas) <- c("Motivo","Número de viajes","Millón PKT (solo tramo principal)", "Millón PKT (total incluyendo caminata inicial y final)","% Número de viajes","% PKT","Emisiones GEI (tCO2-eq)", "Distancia media por viaje (km)", "Duracion media por viaje (min)")
+
+kable(estadisticas, caption = "Estadísticas por motivo", format.args = list(big.mark = ","), digits = 1)
+```
+
+# Cartografía
+
+Finalmente, producimos mapas por distrito.
+
+```{r nombres para ser mostrados, eval = TRUE}
+limites_lima <- st_make_valid(limites_lima)
+centroides_limites_lima <- st_centroid(limites_lima) %>%
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2])
+
+conos_lima <- st_make_valid(conos_lima)
+centroides_conos_lima <- st_centroid(conos_lima) %>%
+  mutate(lon = c(-77.12,-77.09,-76.75,-77.01,-76.81),
+         lat = c(-12.06,-12.13,-12.03,-11.80,-12.17))
+
+centroides_limites_lima$DISPLAY <- centroides_limites_lima$DISTRNOMBR
+centroides_limites_lima$DISPLAY[!(centroides_limites_lima$DISTRNOMBR %in% c("VENTANILLA", "SAN JUAN DE LURIGANCHO", "LURIGANCHO (CHOSICA)", "LURIN", "VILLA EL SALVADOR", "LA MOLINA", "SAN BORJA", "PACHACAMAC", "SANTIAGO DE SURCO", "SANTA ANITA", "LA VICTORIA", "SAN MIGUEL", "LA PUNTA", "ATE", "INDEPENDENCIA", "COMAS", "LIMA", "CHORRILLOS", "LA PUNTA", "SAN ISIDRO", "CIENEGUILLA"))] <- ""
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN JUAN DE LURIGANCHO"] <-"SAN JUAN DE \nLURIGANCHO"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN BORJA"] <-"SAN \nBORJA"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN ISIDRO"] <-"SAN \nISIDRO"
+#centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "MAGDALENA DEL MAR"] <-"MAGDALENA \nDEL MAR"
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "MAGDALENA DEL MAR"] <- -77.09
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "SAN BORJA"] <- -76.97
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "ATE"] <- -76.84
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "PACHACAMAC"] <- -76.87
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "VENTANILLA"] <- -77.12
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "SAN ISIDRO"] <- -77.025
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "LA PUNTA"] <- -77.18
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "LA PUNTA"] <- -12.075
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "VENTANILLA"] <- -11.91
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "LA MOLINA"] <- -12.11
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "SANTIAGO DE SURCO"] <- -12.15
+centroides_conos_lima$lat[centroides_conos_lima$cono == "Callao"] <- -12.04
+
+centroides_limites_lima$DISPLAY <- str_to_title(centroides_limites_lima$DISPLAY)
+```
+
+## Cartografía en español (ggplot2)
+
+```{r dist per capita y viajes}
+Dist_distrito <- viajes_dist[,c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            pop = unique(pop_est_2024),
+            dist_capita = dist/pop,
+            ntrips = sum(fexp_viaje_nuevo))
+
+Distritos_no_na <- Dist_distrito[,"distrito"]
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", "dist", "dist_capita", "ntrips")], by = "distrito")
+```
+
+```{r map dist per capita, fig.asp=1.3, dev = 'svg', eval = FALSE}
+#Colores
+bks_total <- round(as.numeric(quantile(Distritos$dist_capita, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),3)
+bks <- c(bks_total,max(Distritos$dist_capita))
+
+Distritos$binned_dist_capita <- cut(Distritos$dist_capita,bks)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Distritos, color = NA, aes(fill = binned_dist_capita))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "Límite de distrito"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 2.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Área interdistrital"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 4, check_overlap = FALSE) +
+  scale_fill_manual(values = brewer.pal(6,"Purples")) +
+  scale_color_manual(values = c("black", "grey"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(title = "", color = "", fill = "Distancia cotidiana promedio per \ncápita todos modos incluidos (km)", caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023 \nDiscretización con los cuantiles 0.10, 0.25, 0.50, 0.75, 0.90", linetype = "") +
+  theme(legend.position = "bottom",
+        legend.direction = "vertical",
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 0),
+        legend.title = element_text(size = 13),
+        legend.text = element_text(size=13),
+        plot.caption = element_text(size = 9, face = "italic", hjust = 0, vjust = 62),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.2, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(1, "cm"), style = north_arrow_orienteering(text_size = 8))
+```
+
+```{r walking dist per capita}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "A pie",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_walk = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            pop = unique(pop_est_2024),
+            walk_intensity = dist_walk/pop)
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", "dist_walk", "walk_intensity")], by = "distrito")
+```
+
+```{r map walking, fig.asp=1.3, dev = 'svg', eval = FALSE}
+#Colores
+bks_walk <- round(as.numeric(quantile(Distritos$walk_intensity, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),10)
+bks <- c(bks_walk,max(Distritos$walk_intensity))
+
+Distritos$binned_walk_intensity <- cut(Distritos$walk_intensity,bks)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Distritos, color = NA, aes(fill = binned_walk_intensity))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "Límite de distrito"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 2.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Área interdistrital"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono), color = "black", fontface = "bold", size = 4, check_overlap = FALSE) +
+  scale_fill_manual(values = brewer.pal(6,"Reds")) +
+  scale_color_manual(values = c("black", "grey"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(title = "", color = "", fill = "Distancia cotidiana promedio \nper cápita caminando (km)", caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023 \nDiscretización con los cuantiles 0.10, 0.25, 0.50, 0.75, 0.90", linetype = "") +
+  theme(legend.position = "bottom",
+        legend.direction = "vertical",
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 0),
+        legend.title = element_text(size = 13),
+        legend.text = element_text(size=13),
+        plot.caption = element_text(size = 9, face = "italic", hjust = 0, vjust = 62),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.2, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(1, "cm"), style = north_arrow_orienteering(text_size = 8))
+```
+
+```{r car dist per capita}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "Auto",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_auto = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            pop = unique(pop_est_2024),
+            auto_intensity = dist_auto/pop)
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", "dist_auto", "auto_intensity")], by = "distrito")
+```
+
+```{r map car, fig.asp=1.3, dev = 'svg', eval = FALSE}
+#Colores
+bks_car <- round(as.numeric(quantile(Distritos$auto_intensity, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),5)
+bks <- c(bks_car,max(Distritos$auto_intensity))
+
+Distritos$binned_auto_intensity <- cut(Distritos$auto_intensity,bks)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Distritos, color = NA, aes(fill = binned_auto_intensity))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "Límite de distrito"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 2.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Área interdistrital"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono), color = "black", fontface = "bold", size = 4, check_overlap = FALSE) +
+  scale_fill_manual(values = brewer.pal(6,"RdPu")) +
+  scale_color_manual(values = c("black", "grey"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(title = "", color = "", fill = "Distancia cotidiana promedio per \ncápita en auto particular (km)", caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023 \nDiscretización con los cuantiles 0.10, 0.25, 0.50, 0.75, 0.90", linetype = "") +
+  theme(legend.position = "bottom",
+        legend.direction = "vertical",
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 0),
+        legend.title = element_text(size = 13),
+        legend.text = element_text(size=13),
+        plot.caption = element_text(size = 9, face = "italic", hjust = 0, vjust = 62),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.2, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(1, "cm"), style = north_arrow_orienteering(text_size = 8))
+```
+
+```{r transit dist per capita}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "Transporte público",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_transit = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            pop = unique(pop_est_2024),
+            transit_intensity = dist_transit/pop)
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", "dist_transit", "transit_intensity")], by = "distrito")
+```
+
+```{r map transit, fig.asp=1.3, dev = 'svg', eval = FALSE}
+#Colores
+bks_transit <- round(as.numeric(quantile(Distritos$transit_intensity, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- c(bks_transit,max(Distritos$transit_intensity))
+
+Distritos$binned_transit_intensity <- cut(Distritos$transit_intensity,bks)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Distritos, color = NA, aes(fill = binned_transit_intensity))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "Límite de distrito"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 2.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Área interdistrital"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono), color = "black", fontface = "bold", size = 4, check_overlap = FALSE) +
+  scale_fill_manual(values = brewer.pal(6,"Greens")) +
+  scale_color_manual(values = c("black", "grey"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(title = "", color = "", fill = "Distancia cotidiana promedio per \ncápita en transporte público (km)", caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023 \nDiscretización con los cuantiles 0.10, 0.25, 0.50, 0.75, 0.90", linetype = "") +
+  theme(legend.position = "bottom",
+        legend.direction = "vertical",
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 0),
+        legend.title = element_text(size = 13),
+        legend.text = element_text(size=13),
+        plot.caption = element_text(size = 9, face = "italic", hjust = 0, vjust = 62),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.2, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(1, "cm"), style = north_arrow_orienteering(text_size = 8))
+```
+
+```{r ges}
+Dist_distrito <- viajes_dist[,c("distrito", "modo_principal_comparado", "CO2-eq", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(co2 = sum(fexp_viaje_nuevo*`CO2-eq`/1000000),
+            pop = unique(pop_est_2024),
+            co2_capita = 1000*co2/pop)
+
+Dist_distrito <- Distritos_no_na %>% left_join(Dist_distrito, by = "distrito")
+Dist_distrito$co2_capita[is.na(Dist_distrito$co2_capita)] <-0
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", "co2", "co2_capita")], by = "distrito")
+```
+
+```{r map ges, fig.asp=1.3, dev = 'svg', eval = FALSE}
+#Colores
+bks_co2 <- round(as.numeric(quantile(Distritos$co2_capita, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- c(bks_co2,max(Distritos$co2_capita))
+
+Distritos$binned_co2_capita <- cut(Distritos$co2_capita,bks)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = Distritos, color = NA, aes(fill = binned_co2_capita))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "Límite de distrito"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 2.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Área interdistrital"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono), color = "black", fontface = "bold", size = 4, check_overlap = FALSE) +
+  scale_fill_manual(values = brewer.pal(6,"Oranges")) +
+  scale_color_manual(values = c("black", "grey"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(title = "", color = "", fill = "Emisiones cotidianas promedio \nper cápita (kg CO2-eq)", caption = "Autor: Hugo Thomas - Université Rennes 2 / Universidad de los Andes \nFuente: Encuesta Origen-Destino de Hogares, ATU, 2023 \nDiscretización con los cuantiles 0.10, 0.25, 0.50, 0.75, 0.90", linetype = "") +
+  theme(legend.position = "bottom",
+        legend.direction = "vertical",
+        plot.title = element_text(size = 15, face = "bold", hjust = 0.5, vjust = 0),
+        legend.title = element_text(size = 13),
+        legend.text = element_text(size=13),
+        plot.caption = element_text(size = 9, face = "italic", hjust = 0, vjust = 62),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.2, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(1, "cm"), width = unit(1, "cm"), style = north_arrow_orienteering(text_size = 8))
+```
+
+## Cartography in English (map_sf)
+
+## Indicators per capita
+
+```{r previous adaptation work}
+centroides_conos_lima_mapsf <- data.frame(lon = c(-77.12,-77.13,-76.75,-77.01,-76.81),
+                                         lat = c(-12.00,-12.13,-12.03,-11.80,-12.19),
+                                         cono = conos_lima$cono)
+centroides_conos_lima_mapsf <-st_as_sf(centroides_conos_lima_mapsf, coords = c("lon", "lat"), crs = st_crs(4326)) %>% st_transform(32718)
+
+Distritos <- Distritos %>% st_transform(32718)
+conos_lima <- conos_lima %>% st_transform(32718)
+centroides_limites_lima <- centroides_limites_lima %>% st_transform(32718)
+limites_lima <- limites_lima %>% st_transform(32718)
+
+bbox <- st_bbox(c(xmin = -77.18, xmax = -76.68, ymin = -12.35, ymax = -11.75), crs = st_crs(4326)) %>% st_transform(32718)
+bbox <- st_as_sfc(bbox) 
+
+font_add("Agency FB", "C:/Windows/Fonts/AGENCYR.TTF")
+showtext_auto()
+
+font_add("Arial", "C:/Windows/Fonts/arial.TTF")
+showtext_auto()
+
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALNB.TTF")
+showtext_auto()
+
+font_add("Bahnschrift", "C:/Windows/Fonts/bahnschrift.ttf")
+showtext_auto()
+```
+
+
+```{r map dist capita mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/dist_lima.svg")
+
+mf_theme(background = "white",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "dist_capita",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "Purples",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nAverage daily distance \nper capita (km)", 
+  leg_title_cex = 1.1,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+x = centroides_limites_lima,
+var = "DISPLAY",
+col = "black",
+halo = TRUE,
+cex = 1,
+overlap = FALSE,
+lines = FALSE,
+add = TRUE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2,
+  add = TRUE
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Author: Hugo Thomas \nSource: ATU, 2023 \nDiscretization in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 1,
+           )
+
+mf_arrow(pos = "topright",
+         cex = 2)
+
+mf_scale(size = 10, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(40,0), cex = 1)
+
+mf_frame(col = "black")
+
+dev.off()
+```
+```{r map dist walk mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/walking_lima.svg")
+
+mf_theme(background = "white",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "walk_intensity",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "Reds",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nAverage daily walking distance \nper capita (km)", 
+  leg_title_cex = 1.1,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Author: Hugo Thomas \nSource: ATU, 2023 \nDiscretization in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 1,
+           )
+
+mf_arrow(pos = "topright",
+         cex = 2)
+
+mf_scale(size = 10, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(40,0), cex = 1)
+
+mf_frame(col = "black")
+
+dev.off()
+```
+```{r map dist car mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/car_lima.svg")
+
+mf_theme(background = "white",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "auto_intensity",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "RdPu",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nAverage daily distance in \nprivate car per capita (km)", 
+  leg_title_cex = 1.1,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Author: Hugo Thomas \nSource: ATU, 2023 \nDiscretization in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 1,
+           )
+
+mf_arrow(pos = "topright",
+         cex = 2)
+
+mf_scale(size = 10, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(40,0), cex = 1)
+
+mf_frame(col = "black")
+
+dev.off()
+```
+```{r map dist transit mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/transit_lima.svg")
+
+mf_theme(background = "white",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "transit_intensity",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "Greens",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nAverage daily distance in \npublic transport per capita (km)", 
+  leg_title_cex = 1.1,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Author: Hugo Thomas \nSource: ATU, 2023 \nDiscretization in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 1,
+           )
+
+mf_arrow(pos = "topright",
+         cex = 2)
+
+mf_scale(size = 10, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(40,0), cex = 1)
+
+mf_frame(col = "black")
+
+dev.off()
+```
+```{r map ges mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/ges_lima.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box + shadow
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "co2_capita",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "Oranges",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nAverage daily GHG emissions \nper capita (kg CO2-eq)", 
+  leg_title_cex = 1.3,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# prop map
+#mf_map(x = Distritos, var = "co2", type = "prop",border = "grey20",col = NA,lwd = 2,leg_pos = NA, add = TRUE)
+
+#mf_legend(type = "prop",val = Distritos$co2,border = "grey20",col = NA,lwd = 2,title = "Total daily GHG \nemissions (tCO2-eq)", title_cex = 1.1,val_cex = 1.1,val_rnd = 0,size = 1.1,pos = "bottomleft",self_adjust = TRUE,adj = c(15,0))
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: ATU, 2023 - MINAM, 2019 - GHG per capita binned in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white"
+           )
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+
+mf_frame(col = "black")
+
+dev.off()
+```
+
+## Indicators per trip
+
+```{r Average dist per trip and trips per capita}
+Distritos$dist_per_trip <- Distritos$dist/Distritos$ntrips
+Distritos$ntrips_capita <- Distritos$ntrips/Distritos$pop_est_2024
+```
+
+```{r average dist per trip walking}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "A pie",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_walk_2 = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            ntrips_walk = sum(fexp_viaje_nuevo),
+            dist_walk_per_trip = dist_walk_2/ntrips_walk,
+            ntrips_walk_capita = ntrips_walk/unique(pop_est_2024))
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", 
+                                                      "dist_walk_2", 
+                                                      "ntrips_walk", 
+                                                      "dist_walk_per_trip",
+                                                      "ntrips_walk_capita")], by = "distrito")
+```
+
+```{r average dist per trip car}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "Auto",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_auto_2 = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            ntrips_auto = sum(fexp_viaje_nuevo),
+            dist_auto_per_trip = dist_auto_2/ntrips_auto,
+            ntrips_auto_capita = ntrips_auto/unique(pop_est_2024))
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", 
+                                                      "dist_auto_2", 
+                                                      "ntrips_auto", 
+                                                      "dist_auto_per_trip",
+                                                      "ntrips_auto_capita")], by = "distrito")
+```
+
+```{r average dist per trip transit}
+Dist_distrito <- viajes_dist[viajes_dist$modo_principal_comparado == "Transporte público",c("distrito", "modo_principal_comparado", "Distancia_incl_caminata", "fexp_viaje_nuevo")]%>%
+  left_join(Distritos[,c("distrito", "pop_est_2024")], by = "distrito") %>%
+  group_by(distrito) %>%
+  summarize(dist_transit_2 = sum(fexp_viaje_nuevo*Distancia_incl_caminata/1000),
+            ntrips_transit = sum(fexp_viaje_nuevo),
+            dist_transit_per_trip = dist_transit_2/ntrips_transit,
+            ntrips_transit_capita = ntrips_transit/unique(pop_est_2024))
+
+Distritos <- Distritos %>% left_join(Dist_distrito[,c("distrito", 
+                                                      "dist_transit_2", 
+                                                      "ntrips_transit", 
+                                                      "dist_transit_per_trip",
+                                                      "ntrips_transit_capita")], by = "distrito")
+```
+
+# Bivariate maps
+
+```{r thresholds}
+thresholds <- data.frame(ntrips_walk_capita = median(Distritos$ntrips_walk_capita),
+                         ntrips_auto_capita = median(Distritos$ntrips_auto_capita),
+                         ntrips_transit_capita = median(Distritos$ntrips_transit_capita),
+                         dist_walk_per_trip = median(Distritos$dist_walk_per_trip),
+                         dist_auto_per_trip = median(Distritos$dist_auto_per_trip),
+                         dist_transit_per_trip = median(Distritos$dist_transit_per_trip))
+
+#Walking
+Distritos$typo_walk[Distritos$ntrips_walk_capita <= median(Distritos$ntrips_walk_capita) & Distritos$dist_walk_per_trip <= median(Distritos$dist_walk_per_trip)] <- "A few short trips"
+Distritos$typo_walk[Distritos$ntrips_walk_capita <= median(Distritos$ntrips_walk_capita) & Distritos$dist_walk_per_trip > median(Distritos$dist_walk_per_trip)] <- "A few long trips"
+Distritos$typo_walk[Distritos$ntrips_walk_capita > median(Distritos$ntrips_walk_capita) & Distritos$dist_walk_per_trip <= median(Distritos$dist_walk_per_trip)] <- "Many short trips"
+Distritos$typo_walk[Distritos$ntrips_walk_capita > median(Distritos$ntrips_walk_capita) & Distritos$dist_walk_per_trip > median(Distritos$dist_walk_per_trip)] <- "Many long trips"
+
+#Car
+Distritos$typo_auto[Distritos$ntrips_auto_capita <= median(Distritos$ntrips_auto_capita) & Distritos$dist_auto_per_trip <= median(Distritos$dist_auto_per_trip)] <- "A few short trips"
+Distritos$typo_auto[Distritos$ntrips_auto_capita <= median(Distritos$ntrips_auto_capita) & Distritos$dist_auto_per_trip > median(Distritos$dist_auto_per_trip)] <- "A few long trips"
+Distritos$typo_auto[Distritos$ntrips_auto_capita > median(Distritos$ntrips_auto_capita) & Distritos$dist_auto_per_trip <= median(Distritos$dist_auto_per_trip)] <- "Many short trips"
+Distritos$typo_auto[Distritos$ntrips_auto_capita > median(Distritos$ntrips_auto_capita) & Distritos$dist_auto_per_trip > median(Distritos$dist_auto_per_trip)] <- "Many long trips"
+
+#Transit
+Distritos$typo_transit[Distritos$ntrips_transit_capita <= median(Distritos$ntrips_transit_capita) & Distritos$dist_transit_per_trip <= median(Distritos$dist_transit_per_trip)] <- "A few short trips"
+Distritos$typo_transit[Distritos$ntrips_transit_capita <= median(Distritos$ntrips_transit_capita) & Distritos$dist_transit_per_trip > median(Distritos$dist_transit_per_trip)] <- "A few long trips"
+Distritos$typo_transit[Distritos$ntrips_transit_capita > median(Distritos$ntrips_transit_capita) & Distritos$dist_transit_per_trip <= median(Distritos$dist_transit_per_trip)] <- "Many short trips"
+Distritos$typo_transit[Distritos$ntrips_transit_capita > median(Distritos$ntrips_transit_capita) & Distritos$dist_transit_per_trip > median(Distritos$dist_transit_per_trip)] <- "Many long trips"
+
+#Set to factors
+Distritos <- Distritos %>% mutate(across(c("typo_walk", "typo_auto", "typo_transit"), factor, levels=c("A few short trips","A few long trips","Many short trips","Many long trips")))
+
+# to convert from number of trips per capita to number of trips per 1000 hab
+
+Distritos$ntrips_walk_1000_hab <- 1000*Distritos$ntrips_walk_capita
+Distritos$ntrips_auto_1000_hab <- 1000*Distritos$ntrips_auto_capita
+Distritos$ntrips_transit_1000_hab <- 1000*Distritos$ntrips_transit_capita
+
+
+# to coerce values to factor
+Distritos$typo_walk <- as.factor(Distritos$typo_walk)
+Distritos$typo_auto <- as.factor(Distritos$typo_auto)
+Distritos$typo_transit <- as.factor(Distritos$typo_transit)
+
+# to reorder factors
+Distritos$typo_walk <- factor(
+  Distritos$typo_walk,
+  levels = c(
+    "A few short trips",
+    "A few long trips",
+    "Many short trips",
+    "Many long trips"
+  )
+)
+
+Distritos$typo_auto <- factor(
+  Distritos$typo_auto,
+  levels = c(
+    "A few short trips",
+    "A few long trips",
+    "Many short trips",
+    "Many long trips"
+  )
+)
+
+Distritos$typo_transit <- factor(
+  Distritos$typo_transit,
+  levels = c(
+    "A few short trips",
+    "A few long trips",
+    "Many short trips",
+    "Many long trips"
+  )
+)
+
+# to change the names of the factors
+levels(Distritos$typo_walk) <- c(
+  "Fewer trips per 1000 inhab. and shorter distances",
+  "Fewer trips per 1000 inhab. and longer distances",
+  "More trips per 1000 inhab. and shorter distances",
+  "More trips per 1000 inhab. and longer distances"
+)
+
+levels(Distritos$typo_auto) <- c(
+  "Fewer trips per 1000 inhab. and shorter distances",
+  "Fewer trips per 1000 inhab. and longer distances",
+  "More trips per 1000 inhab. and shorter distances",
+  "More trips per 1000 inhab. and longer distances"
+)
+
+levels(Distritos$typo_transit) <- c(
+  "Fewer trips per 1000 inhab. and shorter distances",
+  "Fewer trips per 1000 inhab. and longer distances",
+  "More trips per 1000 inhab. and shorter distances",
+  "More trips per 1000 inhab. and longer distances"
+)
+```
+
+```{r typo walking mapsf}
+# Export
+mf_svg(x = bbox, filename = "typo_walking_lima.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box + shadow
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "typo_walk",
+  pal = c("#FFE2E2", "#FF6467", "#ECFCCA", "#9AE630"),
+  type = "typo",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nWalking intensity", 
+  leg_title_cex = 1.3,
+  leg_val_cex = 1.1,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: ATU, 2023. Typology based on median values - Packages ggplot 2 / mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white"
+)
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+
+
+# définition de la taille de l'encart, dans l'unité de la fenêtre graphique (ndc)
+x1 <- 0.53
+x2 <- 0.95
+y1 <- 0.72
+y2 <- 0.97
+
+# --- Construction du scatter (ggplot) ---
+
+df <- st_drop_geometry(Distritos)
+
+med_x <- median(df$dist_walk_per_trip, na.rm = TRUE)
+med_y <- median(df$ntrips_walk_1000_hab, na.rm = TRUE)
+
+quadrants <- data.frame(
+  xmin = c(min(df$dist_walk_per_trip), med_x, min(df$dist_walk_per_trip), med_x),
+  xmax = c(med_x, max(df$dist_walk_per_trip), med_x, max(df$dist_walk_per_trip)),
+  ymin = c(min(df$ntrips_walk_1000_hab), min(df$ntrips_walk_1000_hab), med_y, med_y),
+  ymax = c(med_y, med_y, max(df$ntrips_walk_1000_hab), max(df$ntrips_walk_1000_hab)),
+  fill = c("Q1", "Q2", "Q3", "Q4")
+)
+
+quad_cols <- c(
+  "Q1" = "#FFE2E2",
+  "Q2" = "#FF6467",
+  "Q3" = "#ECFCCA",
+  "Q4" = "#9AE630"
+)
+
+legende <- ggplot() +
+  geom_rect(
+    data = quadrants,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+    alpha = 1
+  ) +
+  geom_point(
+    data = df,
+    aes(x = dist_walk_per_trip, y = ntrips_walk_1000_hab),
+    color = "black", size = 0.5
+  ) +
+  geom_vline(xintercept = med_x, linetype = "dashed") +
+  geom_hline(yintercept = med_y, linetype = "dashed") +
+  scale_fill_manual(values = quad_cols, guide = "none") +
+  labs(x = "Dist. per trip", y = "Trips per 1000 inhabitants") +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Arial Narrow"),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = "black", linewidth = 0.4)
+  )
+
+# 1. Paramètres de l’encart (NDC : entre 0 et 1)
+vp <- viewport(
+  x = x1 + (x2 - x1)/2,   # centre en x
+  y = y1 + (y2 - y1)/2,   # centre en y
+  width  = x2 - x1,       # largeur
+  height = y2 - y1        # hauteur
+)
+
+# 2. Capture du graphique ggplot comme objet grid
+legende <- grid.grabExpr(print(legende))
+
+# 3. Activation du nouvel espace graphique de l'encart
+par(fig = c(x1, x2, y1, y2),
+    mar = c(0, 0, 0, 0),
+    new = TRUE)
+
+# 4. Dessin du ggplot DANS le viewport
+pushViewport(vp)
+grid.draw(legende)
+popViewport()
+
+# Revenir à la figure pleine
+par(fig = c(0, 1, 0, 1), new = FALSE)
+
+mf_frame(col = "black")
+
+par(op)
+
+dev.off()
+```
+```{r typo car mapsf}
+# Export
+mf_svg(x = bbox, filename = "typo_auto_lima.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box + shadow
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "typo_auto",
+  pal = c("#FFE2E2", "#FF6467", "#ECFCCA", "#9AE630"),
+  type = "typo",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nPrivate car intensity", 
+  leg_title_cex = 1.3,
+  leg_val_cex = 1.1,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: ATU, 2023. Typology based on median values - Packages ggplot 2 / mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white"
+)
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+
+
+# définition de la taille de l'encart, dans l'unité de la fenêtre graphique (ndc)
+x1 <- 0.53
+x2 <- 0.95
+y1 <- 0.72
+y2 <- 0.97
+
+# --- Construction du scatter (ggplot) ---
+
+df <- st_drop_geometry(Distritos)
+
+med_x <- median(df$dist_auto_per_trip, na.rm = TRUE)
+med_y <- median(df$ntrips_auto_1000_hab, na.rm = TRUE)
+
+quadrants <- data.frame(
+  xmin = c(min(df$dist_auto_per_trip), med_x, min(df$dist_auto_per_trip), med_x),
+  xmax = c(med_x, max(df$dist_auto_per_trip), med_x, max(df$dist_auto_per_trip)),
+  ymin = c(min(df$ntrips_auto_1000_hab), min(df$ntrips_auto_1000_hab), med_y, med_y),
+  ymax = c(med_y, med_y, max(df$ntrips_auto_1000_hab), max(df$ntrips_auto_1000_hab)),
+  fill = c("Q1", "Q2", "Q3", "Q4")
+)
+
+quad_cols <- c(
+  "Q1" = "#FFE2E2",
+  "Q2" = "#FF6467",
+  "Q3" = "#ECFCCA",
+  "Q4" = "#9AE630"
+)
+
+legende <- ggplot() +
+  geom_rect(
+    data = quadrants,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+    alpha = 1
+  ) +
+  geom_point(
+    data = df,
+    aes(x = dist_auto_per_trip, y = ntrips_auto_1000_hab),
+    color = "black", size = 0.5
+  ) +
+  geom_vline(xintercept = med_x, linetype = "dashed") +
+  geom_hline(yintercept = med_y, linetype = "dashed") +
+  scale_fill_manual(values = quad_cols, guide = "none") +
+  labs(x = "Dist. per trip", y = "Trips per 1000 inhabitants") +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Arial Narrow"),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = "black", linewidth = 0.4)
+  )
+
+# 1. Paramètres de l’encart (NDC : entre 0 et 1)
+vp <- viewport(
+  x = x1 + (x2 - x1)/2,   # centre en x
+  y = y1 + (y2 - y1)/2,   # centre en y
+  width  = x2 - x1,       # largeur
+  height = y2 - y1        # hauteur
+)
+
+# 2. Capture du graphique ggplot comme objet grid
+legende <- grid.grabExpr(print(legende))
+
+# 3. Activation du nouvel espace graphique de l'encart
+par(fig = c(x1, x2, y1, y2),
+    mar = c(0, 0, 0, 0),
+    new = TRUE)
+
+# 4. Dessin du ggplot DANS le viewport
+pushViewport(vp)
+grid.draw(legende)
+popViewport()
+
+# Revenir à la figure pleine
+par(fig = c(0, 1, 0, 1), new = FALSE)
+
+mf_frame(col = "black")
+
+par(op)
+
+dev.off()
+```
+
+```{r typo transit mapsf}
+# Export
+mf_svg(x = bbox, filename = "typo_transit_lima.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box + shadow
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# Main map
+mf_map(
+  x = Distritos,
+  var = "typo_transit",
+  pal = c("#FFE2E2", "#FF6467", "#ECFCCA", "#9AE630"),
+  type = "typo",
+  border = NA,
+  lwd = 1,
+  leg_title = "\nPublic transport intensity", 
+  leg_title_cex = 1.3,
+  leg_val_cex = 1.1,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: ATU, 2023. Typology based on median values - Packages ggplot 2 / mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white"
+)
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+
+
+# définition de la taille de l'encart, dans l'unité de la fenêtre graphique (ndc)
+x1 <- 0.53
+x2 <- 0.95
+y1 <- 0.72
+y2 <- 0.97
+
+# --- Construction du scatter (ggplot) ---
+
+df <- st_drop_geometry(Distritos)
+
+med_x <- median(df$dist_transit_per_trip, na.rm = TRUE)
+med_y <- median(df$ntrips_transit_1000_hab, na.rm = TRUE)
+
+quadrants <- data.frame(
+  xmin = c(min(df$dist_transit_per_trip), med_x, min(df$dist_transit_per_trip), med_x),
+  xmax = c(med_x, max(df$dist_transit_per_trip), med_x, max(df$dist_transit_per_trip)),
+  ymin = c(min(df$ntrips_transit_1000_hab), min(df$ntrips_transit_1000_hab), med_y, med_y),
+  ymax = c(med_y, med_y, max(df$ntrips_transit_1000_hab), max(df$ntrips_transit_1000_hab)),
+  fill = c("Q1", "Q2", "Q3", "Q4")
+)
+
+quad_cols <- c(
+  "Q1" = "#FFE2E2",
+  "Q2" = "#FF6467",
+  "Q3" = "#ECFCCA",
+  "Q4" = "#9AE630"
+)
+
+legende <- ggplot() +
+  geom_rect(
+    data = quadrants,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+    alpha = 1
+  ) +
+  geom_point(
+    data = df,
+    aes(x = dist_transit_per_trip, y = ntrips_transit_1000_hab),
+    color = "black", size = 0.5
+  ) +
+  geom_vline(xintercept = med_x, linetype = "dashed") +
+  geom_hline(yintercept = med_y, linetype = "dashed") +
+  scale_fill_manual(values = quad_cols, guide = "none") +
+  labs(x = "Dist. per trip", y = "Trips per 1000 inhabitants") +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Arial Narrow"),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = "black", linewidth = 0.4)
+  )
+
+# 1. Paramètres de l’encart (NDC : entre 0 et 1)
+vp <- viewport(
+  x = x1 + (x2 - x1)/2,   # centre en x
+  y = y1 + (y2 - y1)/2,   # centre en y
+  width  = x2 - x1,       # largeur
+  height = y2 - y1        # hauteur
+)
+
+# 2. Capture du graphique ggplot comme objet grid
+legende <- grid.grabExpr(print(legende))
+
+# 3. Activation du nouvel espace graphique de l'encart
+par(fig = c(x1, x2, y1, y2),
+    mar = c(0, 0, 0, 0),
+    new = TRUE)
+
+# 4. Dessin du ggplot DANS le viewport
+pushViewport(vp)
+grid.draw(legende)
+popViewport()
+
+# Revenir à la figure pleine
+par(fig = c(0, 1, 0, 1), new = FALSE)
+
+mf_frame(col = "black")
+
+par(op)
+
+dev.off()
+```
+
+
+# Correlaciones
+
+```{r update distritos}
+Distritos_ICS <- read.xlsx("Distritos_ICS.xlsx")
+
+Distritos <- Distritos %>% left_join(Distritos_ICS[, c("distrit", "propICS12")], by = c("distrito" = "distrit"))
+
+#write.xlsx(st_drop_geometry(Distritos), "Distritos_all_indicators.xlsx")
+```
+
+
+```{r correlaciones}
+correlaciones <- rbind(data.frame(cor.test(Distritos$propICS12, Distritos$auto_intensity, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$propICS12, Distritos$walk_intensity, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$propICS12, Distritos$transit_intensity, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$co2_capita, Distritos$auto_intensity, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$propICS12, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_auto_per_trip, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_walk_per_trip, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_transit_per_trip, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_auto_per_trip, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_walk_per_trip, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_transit_per_trip, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_per_trip, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$dist_capita, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_capita, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_auto_capita, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_walk_capita, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_transit_capita, Distritos$propICS12, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_capita, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_auto_capita, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_walk_capita, Distritos$co2_capita, method = "pearson")[c(4,3)]),
+              data.frame(cor.test(Distritos$ntrips_transit_capita, Distritos$co2_capita, method = "pearson")[c(4,3)]))
+
+rownames(correlaciones) <- c("ICS_dist_auto_capita",
+                             "ICS_dist_walk_capita",
+                             "ICS_dist_transit_capita",
+                             "GES_dist_auto_capita",
+                             "ICS_GES_capita",
+                             "GES_dist_auto_trip",
+                             "GES_dist_walk_trip",
+                             "GES_dist_transit_trip",
+                             "ICS_dist_auto_trip",
+                             "ICS_dist_walk_trip",
+                             "ICS_dist_transit_trip",
+                             "dist_trip_total_ICS",
+                             "dist_capita_total_ICS",
+                             "ntrips_per_capita_ICS",
+                             "ntrips_per_capita_auto_ICS",
+                             "ntrips_per_capita_walk_ICS",
+                             "ntrips_per_capita_transit_ICS",
+                             "ntrips_per_capita_GES",
+                             "ntrips_per_capita_auto_GES",
+                             "ntrips_per_capita_walk_GES",
+                             "ntrips_per_capita_transit_GES")
+
+kable(correlaciones, caption = "Correlaciones", format.args = list(big.mark = ","))
+
+correlaciones <- cbind(rownames(correlaciones), correlaciones)
+
+#write.xlsx(correlaciones, "correlaciones.xlsx", overwrite = TRUE)
+```
+
+# Palma ratio
+
+```{r palma}
+Distritos_top_10 <- Distritos[order(Distritos$propICS12, decreasing = FALSE),]
+select <-as.integer(0.1*nrow(Distritos_top_10))
+Distritos_top_10 <- Distritos_top_10[1:select,]
+
+Distritos_bottom_40 <- Distritos[order(Distritos$propICS12, decreasing = TRUE),]
+select <-as.integer(0.4*nrow(Distritos_bottom_40))
+Distritos_bottom_40 <- Distritos_bottom_40[1:select,]
+
+palma <- rbind(data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_capita, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$auto_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$auto_intensity, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$walk_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$walk_intensity, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$transit_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$transit_intensity, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$co2_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$co2_capita, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_per_trip, w = Distritos_top_10$ntrips),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_per_trip, w = Distritos_bottom_40$ntrips)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_auto_per_trip, w = Distritos_top_10$ntrips_auto),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_auto_per_trip, w = Distritos_bottom_40$ntrips_auto)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_walk_per_trip, w = Distritos_top_10$ntrips_walk),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_walk_per_trip, w = Distritos_bottom_40$ntrips_walk)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_transit_per_trip, w = Distritos_top_10$ntrips_transit),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_transit_per_trip, w = Distritos_bottom_40$ntrips_transit)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$co2, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$co2, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_auto, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_auto, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_walk, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_walk, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_transit, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_transit, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_auto, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_auto, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_walk, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_walk, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_transit, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$dist_transit, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_capita, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_auto_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_auto_capita, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_walk_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_walk_capita, w = Distritos_bottom_40$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_transit_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_40 = weighted.mean(x = Distritos_bottom_40$ntrips_transit_capita, w = Distritos_bottom_40$pop_est_2024)))
+
+
+palma$palma <- palma$top_10/palma$bottom_40
+
+rownames(palma) <- c("dist_capita",
+                     "auto_intensity",
+                     "walk_intensity",
+                     "transit_intensity",
+                     "co2_capita",
+                     "dist_trip",
+                     "dist_auto_trip",
+                     "dist_walk_trip",
+                     "dist_transit_trip",
+                     "co2_total",
+                     "ntrips_total",
+                     "ntrips_auto",
+                     "ntrips_walk",
+                     "ntrips_transit",
+                     "PKT_total",
+                     "PKT_auto",
+                     "PKT_walk",
+                     "PKT_transit",
+                     "ntrips_per_capita",
+                     "ntrips_auto_per_capita",
+                     "ntrips_walk_per_capita",
+                     "ntrips_transit_per_capita")
+
+kable(palma, caption = "Palma ratios", format.args = list(big.mark = ","))
+
+palma <- cbind(rownames(palma), palma)
+
+#write.xlsx(palma, "palma.xlsx", overwrite = TRUE)
+```
+
+# Inter-decile ratio
+
+```{r inter-decile}
+Distritos_bottom_10 <- Distritos[order(Distritos$propICS12, decreasing = TRUE),]
+select <-as.integer(0.1*nrow(Distritos_bottom_10))
+Distritos_bottom_10 <- Distritos_bottom_10[1:select,]
+
+interdecile <- rbind(data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_capita, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$auto_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$auto_intensity, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$walk_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$walk_intensity, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$transit_intensity, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$transit_intensity, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$co2_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$co2_capita, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_per_trip, w = Distritos_top_10$ntrips),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_per_trip, w = Distritos_bottom_10$ntrips)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_auto_per_trip, w = Distritos_top_10$ntrips_auto),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_auto_per_trip, w = Distritos_bottom_10$ntrips_auto)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_walk_per_trip, w = Distritos_top_10$ntrips_walk),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_walk_per_trip, w = Distritos_bottom_10$ntrips_walk)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_transit_per_trip, w = Distritos_top_10$ntrips_transit),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_transit_per_trip, w = Distritos_bottom_10$ntrips_transit)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$co2, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$co2, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_auto, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_auto, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_walk, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_walk, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_transit, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_transit, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_auto, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_auto, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_walk, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_walk, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$dist_transit, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$dist_transit, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_capita, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_auto_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_auto_capita, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_walk_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_walk_capita, w = Distritos_bottom_10$pop_est_2024)),
+               data.frame(top_10 = weighted.mean(x = Distritos_top_10$ntrips_transit_capita, w = Distritos_top_10$pop_est_2024),
+                   bottom_10 = weighted.mean(x = Distritos_bottom_10$ntrips_transit_capita, w = Distritos_bottom_10$pop_est_2024)))
+
+
+interdecile$interdecile <- interdecile$top_10/interdecile$bottom_10
+
+rownames(interdecile) <- c("dist_capita",
+                     "auto_intensity",
+                     "walk_intensity",
+                     "transit_intensity",
+                     "co2_capita",
+                     "dist_trip",
+                     "dist_auto_trip",
+                     "dist_walk_trip",
+                     "dist_transit_trip",
+                     "co2_total",
+                     "ntrips_total",
+                     "ntrips_auto",
+                     "ntrips_walk",
+                     "ntrips_transit",
+                     "PKT_total",
+                     "PKT_auto",
+                     "PKT_walk",
+                     "PKT_transit",
+                     "ntrips_per_capita",
+                     "ntrips_auto_per_capita",
+                     "ntrips_walk_per_capita",
+                     "ntrips_transit_per_capita")
+
+kable(interdecile, caption = "Inter-decile ratios", format.args = list(big.mark = ","))
+
+interdecile <- cbind(rownames(interdecile), interdecile)
+
+#write.xlsx(interdecile, "interdecile.xlsx", overwrite = TRUE)
+```
+
+
+# Valores promediados de los indicadores
+
+```{r promedios}
+promedios <- data.frame(dist_capita = sum(Distritos$dist)/sum(Distritos$pop_est_2024),
+                        walk_intensity = sum(Distritos$dist_walk)/sum(Distritos$pop_est_2024),
+                        auto_intensity = sum(Distritos$dist_auto)/sum(Distritos$pop_est_2024),
+                        transit_intensity = sum(Distritos$dist_transit)/sum(Distritos$pop_est_2024),
+                        ges_capita = 1000*sum(Distritos$co2)/sum(Distritos$pop_est_2024))
+
+kable(promedios, caption = "Valores promediados de los indicadores", format.args = list(big.mark = ","))
+
+#write.xlsx(promedios, "promedios.xlsx", overwrite = TRUE)
+```
+
+# Posesión de vehículos
+
+```{r vehículos, eval = TRUE}
+Hogares$q7_5_2[is.na(Hogares$q7_5_2)] <- 0
+Hogares$q7_3_2[is.na(Hogares$q7_3_2)] <- 0
+Hogares$q7_2_2[is.na(Hogares$q7_2_2)] <- 0
+
+colnames(Hogares)[colnames(Hogares) == "q7_2_2"] <- "num_bici"
+colnames(Hogares)[colnames(Hogares) == "q7_3_2"] <- "num_moto"
+colnames(Hogares)[colnames(Hogares) == "q7_5_2"] <- "num_auto"
+
+#Corrigiendo valores aberrantes de la posesión de autos (valores negativos, valores de varios miles...)
+Hogares$num_auto[Hogares$num_auto < 0 | Hogares$num_auto > 100] <- 0
+
+vehiculos <- Hogares[,c("id_hog", "distrito", "num_bici", "num_moto", "num_auto", "fexp_hogar_nuevo", "num_pers_hog")] %>%
+  group_by(distrito) %>%
+  summarise(poblacion = sum(fexp_hogar_nuevo*num_pers_hog), 
+            num_bici = sum(fexp_hogar_nuevo*num_bici), 
+            num_moto = sum(fexp_hogar_nuevo*num_moto), 
+            num_auto = sum(fexp_hogar_nuevo*num_auto),
+            auto_1000_hab = 1000*num_auto/poblacion,
+            moto_1000_hab = 1000*num_moto/poblacion,
+            bici_1000_hab = 1000*num_bici/poblacion) %>%
+  st_drop_geometry()
+
+vehiculos_total <- data.frame(distrito = "TOTAL",
+                              poblacion = sum(vehiculos$poblacion),
+                              num_bici = sum(vehiculos$num_bici),
+                              num_moto = sum(vehiculos$num_moto),
+                              num_auto = sum(vehiculos$num_auto))
+vehiculos_total$auto_1000_hab = 1000*vehiculos_total$num_auto/vehiculos_total$poblacion
+vehiculos_total$moto_1000_hab = 1000*vehiculos_total$num_moto/vehiculos_total$poblacion
+vehiculos_total$bici_1000_hab = 1000*vehiculos_total$num_bici/vehiculos_total$poblacion
+
+vehiculos <- rbind(vehiculos, vehiculos_total)
+
+kable(vehiculos, caption = "Número de vehículos por distrito y tasa de posesión por 1000 hab", format.args = list(big.mark = ","), digits = 0)
+
+#write.xlsx(vehiculos, "vehiculos.xlsx")
+```
+# Map ICS
+
+```{r map ICS mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/Lima_ICS.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# choro map
+mf_map(
+  x = Distritos,
+  var = "propICS12",
+  type = "choro",
+  breaks = "quantile",
+  nbreaks = 5,
+  pal = "Reds",
+  border = NA,
+  lwd = 1,
+  leg_title = "\n% low-ICS \nhouseholds", 
+  leg_title_cex = 1.3,
+  leg_val_cex = 1.1,
+  leg_val_rnd = 2,
+  leg_size = 1.1,
+  leg_pos = "bottomleft",
+  add = TRUE
+)
+
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: INEI, 2017 - Binning in quintiles - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white")
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+mf_frame(col = "black")
+
+dev.off()
+```
+
+# Map Public Transport
+
+```{r more work on data}
+Metro <- Metro %>% st_transform(32718)
+BRT <- BRT %>% st_transform(32718)
+Bus <- Bus %>% st_transform(32718)
+Combi <- Combi %>% st_transform(32718)
+Custer <- Custer %>% st_transform(32718)
+
+BRT_trunk <- BRT[BRT$layer == "brt_troncal",]
+BRT_alim <- BRT[BRT$layer == "brt_alimentadores",]
+```
+
+```{r map public transport network mapsf, fig.asp = 1}
+# Export
+mf_svg(x = bbox, filename = "Distancias_ATU_2023_con_caminata_previa_files/figure-html/Lima_TC.svg")
+
+# Ajouter la police "Arial Narrow"
+font_add("Arial Narrow", "C:/Windows/Fonts/ARIALN.TTF")
+showtext_auto()
+op <- par(family = "Arial Narrow")
+
+mf_theme(background = "ivory",
+         highlight = "black",
+         mar = c(.5,.5,.5,.5), 
+         title_inner = TRUE)
+
+# Bounding box + shadow
+mf_map(bbox, col = NA, border = NA, expandBB = rep(-0.04, 4))
+mf_shadow(conos_lima, add = TRUE) # to add a shadow
+mf_map(conos_lima, type = "base", border = NA, col = "grey95", add = TRUE)
+
+# Urban area
+mf_map(
+  x = Distritos, 
+  type = "base",
+  border = NA,
+  col = "grey80",
+  lwd = 0.2,
+  add = TRUE
+)
+
+# District Borders
+mf_map(
+  x = limites_lima, 
+  type = "base",
+  border = "grey",
+  col = NA,
+  lwd = 0.2,
+  add = TRUE
+)
+
+# Conos Borders
+mf_map(
+  x = conos_lima, 
+  type = "base",
+  border = "black",
+  col = NA,
+  lwd = 0.5,
+  add = TRUE
+)
+
+# Bus
+mf_map(
+  x = Bus, 
+  type = "base",
+  col = "darkorange",
+  lwd = 0.2,
+  leg_title = "Bus",
+  add = TRUE
+)
+
+# Custer
+mf_map(
+  x = Custer, 
+  type = "base",
+  col = "darkorange",
+  lwd = 0.2,
+  leg_title = "Custer",
+  add = TRUE
+)
+
+# Combi
+mf_map(
+  x = Combi, 
+  type = "base",
+  col = "darkorange",
+  lwd = 0.2,
+  leg_title = "Combi",
+  add = TRUE
+)
+
+# Alimentador
+mf_map(
+  x = BRT_alim, 
+  type = "base",
+  col = "brown1",
+  lwd = 1,
+  add = TRUE
+)
+
+# BRT
+mf_map(
+  x = BRT_trunk, 
+  type = "base",
+  col = "brown1",
+  lwd = 3,
+  add = TRUE
+)
+
+# Metro
+mf_map(
+  x = Metro, 
+  type = "base",
+  col = "green3",
+  lwd = 3,
+  add = TRUE
+)
+
+# District Labels
+mf_label(
+  x = centroides_limites_lima,
+  var = "DISPLAY",
+  col = "black",
+  halo = TRUE,
+  cex = 0.85,
+  overlap = FALSE,
+  lines = FALSE,
+)
+
+# Conos Labels
+mf_label(
+  x = centroides_conos_lima_mapsf,
+  var = "cono",
+  col = "black",
+  halo = TRUE,
+  cex = 1.2,
+  overlap = TRUE,
+  lines = FALSE,
+  font = 2,
+)
+
+#Legend
+
+linewidth = c(4,4)
+
+mf_legend(
+  type = "grad_line",
+  val = c("", "\nMetro"),
+  col = "green3",
+  lwd = linewidth,
+  title = NA, 
+  val_cex = 1.1,
+  size = 1.1,
+  pos = "bottomleft",
+  adj = c(0,12)
+)
+
+mf_legend(
+  type = "grad_line",
+  val = c("", "\nBRT"),
+  col = "brown1",
+  lwd = linewidth,
+  title = NA, 
+  val_cex = 1.1,
+  size = 1.1,
+  pos = "bottomleft",
+  adj = c(0,9)
+)
+
+mf_legend(
+  type = "grad_line",
+  val = c("", "\nFeeder bus"),
+  col = "brown1",
+  lwd = 2,
+  title = NA, 
+  val_cex = 1.1,
+  size = 1.1,
+  pos = "bottomleft",
+  adj = c(0,6)
+)
+
+mf_legend(
+  type = "grad_line",
+  val = c("", "\nLocal bus"),
+  col = "darkorange",
+  lwd = 2,
+  title = NA, 
+  val_cex = 1.1,
+  size = 1.1,
+  pos = "bottomleft",
+  adj = c(0,3)
+)
+
+mf_legend(
+  type = "typo",
+  val = "Urban area",
+  pal = "grey80",
+  title = NA, 
+  val_cex = 1.1,
+  size = 1.1,
+  pos = "bottomleft",
+  adj = c(0,0)
+)
+
+# Layout
+mf_layout(
+  credits = "",
+  title = "",
+  arrow = FALSE,
+  scale = FALSE)
+
+mf_credits(txt = "Source: ATU, 2023 - Package mapsf",
+           col = "black",
+           pos = "rightbottom",
+           cex = 0.95,
+           bg = "white")
+
+mf_arrow(pos = "topright",
+         cex = 0.75)
+
+mf_scale(size = 5, crs_units = "m", scale_units = "km", pos = "bottomleft", adj = c(130,0), cex = 1)
+mf_frame(col = "black")
+
+dev.off()
+```

@@ -1,0 +1,343 @@
+---
+title: "Distancias SITP r5r"
+author: "Hugo Thomas"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE, verbose = FALSE) 
+    knitr::opts_chunk$set(dev = "png",
+                          dpi = 300,
+                          echo = TRUE,
+                          cache = TRUE)
+```
+
+
+# Trabajo preliminar
+
+## Paquetes R
+
+```{r Paquetes}
+library(sf)
+library(r5r)
+library(tidygraph)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(TSP)
+library(openxlsx)
+library(ggplot2)
+library(ggspatial)
+library(knitr)
+library(tidyr)
+library(stringr)
+library(foreach)
+library(doFuture)
+library(rJavaEnv)
+library(skimr)
+
+# check version of Java currently installed (if any) 
+rJavaEnv::java_check_version_rjava()
+
+## if this is the first time you use {rJavaEnv}, you might need to run this code
+## below to consent the installation of Java.
+# rJavaEnv::rje_consent(provided = TRUE)
+
+# install Java 21
+#rJavaEnv::java_quick_install(version = 21)
+
+# check if Java was successfully installed
+#rJavaEnv::java_check_version_rjava()
+
+#Run this in R console to specifyt where Java is installed
+Sys.setenv(JAVA_HOME = "C:\\Users\\22409125\\Documents\\rjavaenv\\windows\\x64\\21")
+```
+
+## Cargando los datos del cuestionario
+
+```{r Data}
+ZAT <- read.xlsx("ZATR5R.xlsx")
+Hogares <- read.xlsx("HogaresR5R.xlsx")
+viajes <- read.xlsx("viajes_R5R.xlsx")
+```
+
+
+# Inicialización de las red (R5R)
+
+```{r ini SITP R5R}
+#Allocating 8 GB of memory to Java (2 GB is a minimum, adjust according to the hardware)
+options(java.parameters = "-Xmx10G")
+
+#By default, {r5r} uses all CPU cores available. If you want to limit the number of CPUs to 6, for example, you can run:  
+options(java.parameters = c("-Xmx10G", "-XX:ActiveProcessorCount=6"))
+
+#Setting up the multimodal network. Requires a .zip archive containing the GTFS and a .pbf file with the road network.
+#It is quite long the first time (~15 min), then it reloads the previously created network.
+list.files(getwd())
+r5r_core <- setup_r5(getwd(), verbose = TRUE, elevation = "NONE")
+
+#Extract OSM network
+street_net <- street_network_to_sf(r5r_core)
+
+#Plot street network
+ggplot() +
+  geom_sf(data = street_net$edges[street_net$edges$street_class %in% c("PRIMARY", "SECONDARY", "TERTIARY"),], aes(color=street_class)) +
+  theme_void()
+
+#Extract public transport network
+transit_net <- r5r::transit_network_to_sf(r5r_core)
+
+#Plot transit network
+ggplot() +
+  geom_sf(data = transit_net$routes) +
+  theme_void()
+```
+
+
+```{r ultimos ajustes}
+# set inputs
+mode <- c("WALK", "TRANSIT")
+departure_datetime <- as.POSIXct("08-08-2023 8:00:00",
+                                 format = "%d-%m-%Y %H:%M:%S")
+
+#El calculo no va a funcionar con los viajes que entran o salen del DC. Por lo tanto, nos limitamos a aquellos viajes internos al DC.
+viajes <- viajes[viajes$nom_mun_ori == "Bogotá" & viajes$nom_mun_des == "Bogotá",]
+
+#Separando la base en 3 sub-bases de acuerdo al lugar de origen y destino
+viajes_12 <- viajes %>% filter(test_origen_destino == "HOGAR_Otro")
+viajes_21 <- viajes %>% filter(test_origen_destino == "Otro_HOGAR")
+viajes_22 <- viajes %>% filter(test_origen_destino == "Otro_Otro")
+```
+
+
+# Cálculo de las distancias por el SITP
+
+```{r Calculo de las distancias, eval = FALSE}
+#1-> 2 (Hogar -> ZAT)
+viajes_12_origen <- cbind(id = viajes_12$cod_hog, Hogares[match(viajes_12$cod_hog, Hogares$id), 1:2, drop = FALSE])
+viajes_12_destino <- cbind(id = viajes_12$zat_des, ZAT[match(viajes_12$zat_des, ZAT$id), 1:2, drop = FALSE])
+
+print(Sys.time())
+detailed_itineraries_12 <- detailed_itineraries(r5r_core = r5r_core,
+                                    origins = viajes_12_origen,
+                                    destinations = viajes_12_destino,
+                                    mode = mode,
+                                    departure_datetime = departure_datetime,
+                                    max_walk_time = 20,
+                                    max_trip_duration = 300,
+                                    shortest_path = TRUE)
+print(Sys.time())
+
+detailed_itineraries_12 <- detailed_itineraries_12  %>% st_drop_geometry()
+detailed_itineraries_12 <- as.data.frame(detailed_itineraries_12)
+
+write.xlsx(detailed_itineraries_12, "detailed_itineraries_12.xlsx")
+
+#2-> 1 (ZAT -> Hogar)
+viajes_21_origen <- cbind(id = viajes_21$zat_ori, ZAT[match(viajes_21$zat_ori, ZAT$id), 1:2, drop = FALSE])
+viajes_21_destino <-  cbind(id = viajes_21$cod_hog, Hogares[match(viajes_21$cod_hog, Hogares$id), 1:2, drop = FALSE])
+
+print(Sys.time())
+detailed_itineraries_21 <- detailed_itineraries(r5r_core = r5r_core,
+                                    origins = viajes_21_origen,
+                                    destinations = viajes_21_destino,
+                                    mode = mode,
+                                    departure_datetime = departure_datetime,
+                                    max_walk_time = 20,
+                                    max_trip_duration = 300,
+                                    shortest_path = TRUE)
+print(Sys.time())
+
+detailed_itineraries_21 <- detailed_itineraries_21  %>% st_drop_geometry()
+detailed_itineraries_21 <- as.data.frame(detailed_itineraries_21)
+
+write.xlsx(detailed_itineraries_21, "detailed_itineraries_21.xlsx")
+
+#2-> 2 (ZAT -> ZAT)
+viajes_22_origen <- cbind(id = viajes_22$zat_ori, ZAT[match(viajes_22$zat_ori, ZAT$id), 1:2, drop = FALSE])
+viajes_22_destino <- cbind(id = viajes_22$zat_des, ZAT[match(viajes_22$zat_des, ZAT$id), 1:2, drop = FALSE])
+
+print(Sys.time())
+detailed_itineraries_22 <- detailed_itineraries(r5r_core = r5r_core,
+                                          origins = viajes_22_origen,
+                                          destinations = viajes_22_destino,
+                                          mode = mode,
+                                          departure_datetime = departure_datetime,
+                                          max_walk_time = 20,
+                                          max_trip_duration = 300,
+                                          shortest_path = TRUE)
+print(Sys.time())
+
+detailed_itineraries_22 <- detailed_itineraries_22  %>% st_drop_geometry()
+detailed_itineraries_22 <- as.data.frame(detailed_itineraries_22)
+
+write.xlsx(test, "detailed_itineraries_22.xlsx")
+```
+
+Tiempos de cálculo
+
+[1] "2025-08-01 09:30:30 CEST"
+
+[1] "2025-08-01 22:05:56 CEST"
+
+[1] "2025-08-01 22:06:03 CEST"
+
+[1] "2025-08-02 09:38:02 CEST"
+
+[1] "2025-08-02 09:38:09 CEST"
+
+[1] "2025-08-02 10:53:59 CEST"
+
+
+
+
+```{r Abriendo de nuevo los archivos calculados}
+detailed_itineraries_12 <- read.xlsx("detailed_itineraries_12.xlsx")
+detailed_itineraries_21 <- read.xlsx("detailed_itineraries_21.xlsx")
+detailed_itineraries_22 <- read.xlsx("detailed_itineraries_22.xlsx")
+```
+
+
+```{r Exportacion}
+#1-> 2 (Hogar -> ZAT)
+
+det12 <- detailed_itineraries_12 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id, mode) %>%
+  summarise(distance = sum(distance))
+det12$from_to <- paste0(det12$from_id, "_", det12$to_id)
+det12 <- as.data.frame.matrix(xtabs(distance ~ from_to + mode, det12))
+det12$from_to = rownames(det12)
+det12 <- separate_wider_delim(det12, cols = from_to, delim = "_", names = c("cod_hog", "zat_des"))
+
+viajes_12 <- merge(viajes_12[,c("cod_vj", "cod_hog", "zat_des")], det12, by = c("cod_hog", "zat_des"))
+#write.xlsx(viajes_12, "viajes12.xlsx")
+
+#2-> 1 (ZAT -> Hogar)
+
+det21 <- detailed_itineraries_21 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id, mode) %>%
+  summarise(distance = sum(distance))
+det21$from_to <- paste0(det21$from_id, "_", det21$to_id)
+det21 <- as.data.frame.matrix(xtabs(distance ~ from_to + mode, det21))
+det21$from_to = rownames(det21)
+det21 <- separate_wider_delim(det21, cols = from_to, delim = "_", names = c("zat_ori", "cod_hog"))
+
+viajes_21 <- merge(viajes_21[,c("cod_vj", "zat_ori", "cod_hog")], det21, by = c("zat_ori", "cod_hog"))
+#write.xlsx(viajes_21, "viajes21.xlsx")
+
+#2-> 2 (ZAT -> ZAT)
+
+det22 <- detailed_itineraries_22 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id, mode) %>%
+  summarise(distance = sum(distance))
+det22$from_to <- paste0(det22$from_id, "_", det22$to_id)
+det22 <- as.data.frame.matrix(xtabs(distance ~ from_to + mode, det22))
+det22$from_to = rownames(det22)
+det22 <- separate_wider_delim(det22, cols = from_to, delim = "_", names = c("zat_ori", "zat_des"))
+
+viajes_22 <- merge(viajes_22[,c("cod_vj", "zat_ori", "zat_des")], det22, by = c("zat_ori", "zat_des"))
+#write.xlsx(viajes_22, "viajes22.xlsx")
+
+viajes_sitp <- rbind(viajes_12[,c("cod_vj", "BUS", "WALK")],
+                     viajes_21[,c("cod_vj", "BUS", "WALK")],
+                     viajes_22[,c("cod_vj", "BUS", "WALK")]) 
+
+viajes_sitp$total <- viajes_sitp$BUS + viajes_sitp$WALK
+
+#write.xlsx(viajes_sitp, "viajes_sitp.xlsx")
+```
+
+```{r Estadísticas}
+estadistica <- as.data.frame(rbind(skim(viajes_sitp$BUS),
+                                  skim(viajes_sitp$WALK),
+                                  skim(viajes_sitp$total)))
+
+estadistica$mode <- c("SITP ZONAL", "WALK", "SITP ZONAL + WALK")
+estadistica <- estadistica[,c(13,5,7:11)]
+colnames(estadistica) <- c("mode", "mean", "min", "q1", "median", "q3", "max")
+
+kable(estadistica, caption = "R5R multimodal distance", digits = 0)
+
+percent_fully_walked <- 100*nrow(viajes_sitp[viajes_sitp$BUS == 0,])/nrow(viajes_sitp)
+percent_fully_walked
+```
+17.4% of the trips were done only walking, that is to say that r5r did not find any SITP route to realize the trip.
+
+```{r Diferencia entre tiempos declarados y reales}
+time12 <- detailed_itineraries_12 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id) %>%
+  summarise(total_duration = unique(total_duration))
+colnames(time12) <- c("cod_hog", "zat_des", "total_duration_r5r")
+
+time12$cod_hog <- as.numeric(time12$cod_hog)
+time12$zat_des <- as.numeric(time12$zat_des)
+time12 <- viajes_12[,c("cod_hog", "zat_des", "cod_vj")] %>%
+  left_join(time12, by = c("cod_hog", "zat_des")) %>%
+  left_join(viajes[viajes$modo_principal_desagrupado == " SITP – Urbano/ Complementario/Especial /Provisional",c("cod_vj", "duracion_min")], by = "cod_vj")
+time12 <- time12[!is.na(time12$duracion_min),]
+
+time21 <- detailed_itineraries_21 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id) %>%
+  summarise(total_duration = unique(total_duration))
+colnames(time21) <- c("zat_ori", "cod_hog", "total_duration_r5r")
+
+time21$zat_ori <- as.numeric(time21$zat_ori)
+time21$cod_hog <- as.numeric(time21$cod_hog)
+time21 <- viajes_21[,c("zat_ori", "cod_hog", "cod_vj")] %>%
+  left_join(time21, by = c("zat_ori", "cod_hog")) %>%
+  left_join(viajes[viajes$modo_principal_desagrupado == " SITP – Urbano/ Complementario/Especial /Provisional",c("cod_vj", "duracion_min")], by = "cod_vj")
+time21 <- time21[!is.na(time21$duracion_min),]
+
+time22 <- detailed_itineraries_22 %>%
+  distinct(from_id, to_id, segment, .keep_all = TRUE) %>% 
+  group_by(from_id, to_id) %>%
+  summarise(total_duration = unique(total_duration))
+colnames(time22) <- c("zat_ori", "zat_des", "total_duration_r5r")
+
+time22$zat_ori <- as.numeric(time22$zat_ori)
+time22$zat_des <- as.numeric(time22$zat_des)
+time22 <- viajes_22[,c("zat_ori", "zat_des", "cod_vj")] %>%
+  left_join(time22, by = c("zat_ori", "zat_des")) %>%
+  left_join(viajes[viajes$modo_principal_desagrupado == " SITP – Urbano/ Complementario/Especial /Provisional",c("cod_vj", "duracion_min")], by = "cod_vj")
+time22 <- time22[!is.na(time22$duracion_min),]
+
+time <- rbind(time12[,c("cod_vj", "total_duration_r5r", "duracion_min")],
+              time21[,c("cod_vj", "total_duration_r5r", "duracion_min")],
+              time22[,c("cod_vj", "total_duration_r5r", "duracion_min")])
+
+#Diferencia
+time$diff <- time$duracion_min-time$total_duration_r5r
+estadistica <- as.data.frame(skim(time$diff))
+
+#Plot
+plot(time$total_duration_r5r, time$duracion_min)
+
+#Regresión lineal
+linear_regression <- lm(duracion_min~total_duration_r5r - 1, data = time)
+summary(linear_regression)
+```
+
+# References
+
+## Web
+
+[r package for Rapid Realistic Routing in multimodal networks: r5r](https://cran.r-project.org/web/packages/r5r/vignettes/r5r.html)
+
+[r5r detailed itineraries](https://cran.r-project.org/web/packages/r5r/vignettes/detailed_itineraries.html)
+
+## Literature review
+
+Conway, M. W., Byrd, A., & Eggermond, M. van. (2018). Accounting for uncertainty and variation in accessibility metrics for public transport sketch planning. Journal of Transport and Land Use, 11(1), Article 1. https://doi.org/10.5198/jtlu.2018.1074
+
+Conway, M. W., Byrd, A., & van der Linden, M. (2017). Evidence-Based Transit and Land Use Sketch Planning Using Interactive Accessibility Methods on Combined Schedule and Headway-Based Networks. Transportation Research Record, 2653(1), 45–53. https://doi.org/10.3141/2653-06
+
+Pereira, R. H. M., Saraiva, M., Herszenhut, D., Braga, C. K. V., & Conway, M. W. (2021). r5r: Rapid Realistic Routing on Multimodal Transport Networks with R5 in R. Findings. https://doi.org/10.32866/001c.21262
